@@ -47,6 +47,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -151,6 +152,7 @@ rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftPGO;
 rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPathAftPGO;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLoopScanLocal, pubLoopSubmapLocal;
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomRepubVerifier;
+rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srvBatchOptimize;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
@@ -955,6 +957,73 @@ void pubMap(void)
     pubMapAftPGO->publish(laserCloudMapPGOMsg);
 }
 
+// One-shot batch re-optimization of the FULL accumulated pose graph, called
+// via the /pgo_batch_optimize service once a session is done. process_isam()
+// only ever runs iSAM2's incremental update (good enough given data seen so
+// far); ISAM2 internally retains every factor it has been given, so
+// getFactorsUnsafe() hands back the complete NonlinearFactorGraph built over
+// the whole run, which a batch Levenberg-Marquardt solve can then optimize
+// as a single global problem instead of walking through it causally.
+// Writes optimized_poses_batch.txt (does not touch the live
+// optimized_poses.txt) and rebuilds+saves a map from the batch poses.
+void batchOptimizeHandler(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+    mtxPosegraph.lock();
+    gtsam::NonlinearFactorGraph fullGraph = isam->getFactorsUnsafe();
+    gtsam::Values initial = isam->calculateEstimate();
+    mtxPosegraph.unlock();
+
+    if (fullGraph.empty() || initial.empty()) {
+        response->success = false;
+        response->message = "Pose graph is empty, nothing to optimize.";
+        return;
+    }
+
+    double initialError = fullGraph.error(initial);
+
+    gtsam::LevenbergMarquardtParams params;
+    params.setVerbosityLM("SUMMARY");
+    params.setMaxIterations(100);
+    gtsam::LevenbergMarquardtOptimizer optimizer(fullGraph, initial, params);
+    gtsam::Values batchEstimate = optimizer.optimize();
+
+    double finalError = fullGraph.error(batchEstimate);
+
+    saveOptimizedVerticesKITTIformat(batchEstimate, save_directory + "optimized_poses_batch.txt");
+
+    pcl::PointCloud<PointType>::Ptr batchMap(new pcl::PointCloud<PointType>());
+    mKF.lock();
+    int n = std::min(int(batchEstimate.size()), int(keyframeLaserClouds.size()));
+    for (int node_idx = 0; node_idx < n; node_idx++) {
+        const gtsam::Pose3& pose = batchEstimate.at<gtsam::Pose3>(node_idx);
+        Pose6D p6;
+        p6.x = pose.translation().x();
+        p6.y = pose.translation().y();
+        p6.z = pose.translation().z();
+        p6.roll = pose.rotation().roll();
+        p6.pitch = pose.rotation().pitch();
+        p6.yaw = pose.rotation().yaw();
+        p6.seq = node_idx;
+        *batchMap += *local2global(keyframeLaserClouds[node_idx], p6);
+    }
+    mKF.unlock();
+
+    downSizeFilterMapPGO.setInputCloud(batchMap);
+    downSizeFilterMapPGO.filter(*batchMap);
+    pcl::io::savePCDFileBinary(save_directory + "map_batch.pcd", *batchMap);
+
+    std::ostringstream msg;
+    msg << "Batch LM re-optimization done over " << n << " keyframes. "
+        << "Graph error " << initialError << " -> " << finalError << ". "
+        << "Poses: " << save_directory << "optimized_poses_batch.txt, "
+        << "map: " << save_directory << "map_batch.pcd";
+    response->success = true;
+    response->message = msg.str();
+    RCLCPP_INFO(g_node->get_logger(), "%s", msg.str().c_str());
+}
+
 void process_viz_map(void)
 {
     rclcpp::Rate rate(vizmapFrequency);
@@ -1072,6 +1141,9 @@ int main(int argc, char **argv)
 
 	pubLoopScanLocal = g_node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_scan_local", 100);
 	pubLoopSubmapLocal = g_node->create_publisher<sensor_msgs::msg::PointCloud2>("/loop_submap_local", 100);
+
+	srvBatchOptimize = g_node->create_service<std_srvs::srv::Trigger>(
+        "/pgo_batch_optimize", batchOptimizeHandler);
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection
