@@ -556,7 +556,7 @@ gtsam::Pose3 doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 
     if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
         std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
-        return gtsam::Pose3::identity();
+        return gtsam::Pose3::Identity();
     } else {
         std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
     }
@@ -890,7 +890,7 @@ void process_icp(void)
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
             auto relative_pose = doICPVirtualRelative(prev_node_idx, curr_node_idx);
-            if( !relative_pose.equals( gtsam::Pose3::identity() )) {
+            if( !relative_pose.equals( gtsam::Pose3::Identity() )) {
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(curr_node_idx, prev_node_idx, relative_pose, robustLoopNoise));
                 mtxPosegraph.unlock();
