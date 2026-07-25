@@ -157,6 +157,11 @@ rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srvBatchOptimize;
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
+// World frame all PGO outputs (map, path, odom, loop markers, TF parent) are
+// stamped in. Mirrors FAST-LIO's publish.map_frame parameter: defaults to the
+// legacy "camera_init" but is overridden to "odom" so the optimized map lands
+// in the same REP-105 tree the lio_map_odom_bridge already publishes.
+std::string map_frame = "camera_init";
 std::fstream pgTimeSaveStream;
 
 // for front_end
@@ -349,15 +354,15 @@ void pubPath( void )
     // pub odom and path
     nav_msgs::msg::Odometry odomAftPGO;
     nav_msgs::msg::Path pathAftPGO;
-    pathAftPGO.header.frame_id = "camera_init";
+    pathAftPGO.header.frame_id = map_frame;
     mKF.lock();
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++)
     {
         const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // updated poses
 
         nav_msgs::msg::Odometry odomAftPGOthis;
-        odomAftPGOthis.header.frame_id = "camera_init";
-        odomAftPGOthis.child_frame_id = "/aft_pgo";
+        odomAftPGOthis.header.frame_id = map_frame;
+        odomAftPGOthis.child_frame_id = "aft_pgo";
         odomAftPGOthis.header.stamp = secToStamp(keyframeTimes.at(node_idx));
         odomAftPGOthis.pose.pose.position.x = pose_est.x;
         odomAftPGOthis.pose.pose.position.y = pose_est.y;
@@ -372,7 +377,7 @@ void pubPath( void )
         poseStampAftPGO.pose = odomAftPGOthis.pose.pose;
 
         pathAftPGO.header.stamp = odomAftPGOthis.header.stamp;
-        pathAftPGO.header.frame_id = "camera_init";
+        pathAftPGO.header.frame_id = map_frame;
         pathAftPGO.poses.push_back(poseStampAftPGO);
     }
     mKF.unlock();
@@ -381,8 +386,8 @@ void pubPath( void )
 
     geometry_msgs::msg::TransformStamped transform;
     transform.header.stamp = odomAftPGO.header.stamp;
-    transform.header.frame_id = "camera_init";
-    transform.child_frame_id = "/aft_pgo";
+    transform.header.frame_id = map_frame;
+    transform.child_frame_id = "aft_pgo";
     transform.transform.translation.x = odomAftPGO.pose.pose.position.x;
     transform.transform.translation.y = odomAftPGO.pose.pose.position.y;
     transform.transform.translation.z = odomAftPGO.pose.pose.position.z;
@@ -527,12 +532,12 @@ gtsam::Pose3 doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
     // loop verification
     sensor_msgs::msg::PointCloud2 cureKeyframeCloudMsg;
     pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
-    cureKeyframeCloudMsg.header.frame_id = "camera_init";
+    cureKeyframeCloudMsg.header.frame_id = map_frame;
     pubLoopScanLocal->publish(cureKeyframeCloudMsg);
 
     sensor_msgs::msg::PointCloud2 targetKeyframeCloudMsg;
     pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
-    targetKeyframeCloudMsg.header.frame_id = "camera_init";
+    targetKeyframeCloudMsg.header.frame_id = map_frame;
     pubLoopSubmapLocal->publish(targetKeyframeCloudMsg);
 
     // ICP Settings
@@ -551,7 +556,7 @@ gtsam::Pose3 doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 
     sensor_msgs::msg::PointCloud2 cureKeyframeCloudRegMsg;
     pcl::toROSMsg(*unused_result, cureKeyframeCloudRegMsg);
-    cureKeyframeCloudRegMsg.header.frame_id = "camera_init";
+    cureKeyframeCloudRegMsg.header.frame_id = map_frame;
     pubLoopScanLocalRegisted->publish(cureKeyframeCloudRegMsg);
 
     if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
@@ -817,7 +822,7 @@ void visualizeLoopClosure()
 
     visualization_msgs::msg::MarkerArray markerArray;
     visualization_msgs::msg::Marker markerNode;
-    markerNode.header.frame_id = "camera_init";
+    markerNode.header.frame_id = map_frame;
     markerNode.header.stamp = secToStamp(keyframeTimes.back());
     markerNode.action = visualization_msgs::msg::Marker::ADD;
     markerNode.type = visualization_msgs::msg::Marker::SPHERE_LIST;
@@ -828,7 +833,7 @@ void visualizeLoopClosure()
     markerNode.color.r = 0; markerNode.color.g = 0.8; markerNode.color.b = 1;
     markerNode.color.a = 1;
     visualization_msgs::msg::Marker markerEdge;
-    markerEdge.header.frame_id = "camera_init";
+    markerEdge.header.frame_id = map_frame;
     markerEdge.header.stamp = secToStamp(keyframeTimes.back());
     markerEdge.action = visualization_msgs::msg::Marker::ADD;
     markerEdge.type = visualization_msgs::msg::Marker::LINE_LIST;
@@ -953,7 +958,7 @@ void pubMap(void)
 
     sensor_msgs::msg::PointCloud2 laserCloudMapPGOMsg;
     pcl::toROSMsg(*laserCloudMapPGO, laserCloudMapPGOMsg);
-    laserCloudMapPGOMsg.header.frame_id = "camera_init";
+    laserCloudMapPGOMsg.header.frame_id = map_frame;
     pubMapAftPGO->publish(laserCloudMapPGOMsg);
 }
 
@@ -1044,6 +1049,10 @@ int main(int argc, char **argv)
 
     g_node->declare_parameter<std::string>("save_directory", "/");
     save_directory = g_node->get_parameter("save_directory").as_string();
+
+    // World frame for all published outputs (see map_frame declaration above).
+    g_node->declare_parameter<std::string>("map_frame", "camera_init");
+    map_frame = g_node->get_parameter("map_frame").as_string();
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgScansDirectory = save_directory + "Scans/";
