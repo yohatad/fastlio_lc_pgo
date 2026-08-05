@@ -53,6 +53,9 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <pcl_ros/transforms.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <Eigen/Dense>
@@ -137,6 +140,11 @@ std::mutex mtxRecentPose;
 
 pcl::PointCloud<PointType>::Ptr laserCloudMapPGO(new pcl::PointCloud<PointType>());
 pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
+// Separate leaf size for the map_batch.pcd written by /pgo_batch_optimize.
+// The saved map is a LOCALIZATION PRIOR and wants to be dense; the RViz map is
+// republished every vizmapFrequency and wants to stay light. Sharing one filter
+// forced a choice between a coarse prior and a laggy RViz.
+pcl::VoxelGrid<PointType> downSizeFilterMapSave;
 bool laserCloudMapPGORedraw = true;
 
 bool useGPS = true;
@@ -183,6 +191,12 @@ double loopFitnessScoreThreshold;
 
 rclcpp::Node::SharedPtr g_node;
 std::shared_ptr<tf2_ros::TransformBroadcaster> g_tf_broadcaster;
+// Used only at save time, to express map_batch.pcd in the gravity-aligned,
+// floor-referenced level frame instead of the raw LIO-anchored map frame.
+std::shared_ptr<tf2_ros::Buffer> g_tf_buffer;
+std::shared_ptr<tf2_ros::TransformListener> g_tf_listener;
+std::string level_frame;
+bool save_in_level_frame = true;
 std::atomic<uint32_t> g_seq_counter{0};
 
 // -- small ROS1 -> ROS2 time helpers --------------------------------------
@@ -1015,8 +1029,36 @@ void batchOptimizeHandler(
     }
     mKF.unlock();
 
-    downSizeFilterMapPGO.setInputCloud(batchMap);
-    downSizeFilterMapPGO.filter(*batchMap);
+    downSizeFilterMapSave.setInputCloud(batchMap);
+    downSizeFilterMapSave.filter(*batchMap);
+
+    // Re-express in the gravity-aligned/floor-referenced level frame (see the
+    // level_frame parameter). Published once by the *_map_odom_bridge, so it
+    // is available as soon as that bridge has leveled.
+    std::string saved_frame = map_frame;
+    if (save_in_level_frame) {
+        try {
+            auto tf = g_tf_buffer->lookupTransform(
+                level_frame, map_frame, tf2::TimePointZero,
+                tf2::durationFromSec(2.0));
+            pcl::PointCloud<PointType>::Ptr leveled(new pcl::PointCloud<PointType>());
+            pcl_ros::transformPointCloud(*batchMap, *leveled, tf);
+            batchMap = leveled;
+            saved_frame = level_frame;
+            RCLCPP_INFO(g_node->get_logger(),
+                "Saved map transformed %s -> %s (gravity-aligned, floor-referenced).",
+                map_frame.c_str(), level_frame.c_str());
+        } catch (const tf2::TransformException &ex) {
+            RCLCPP_WARN(g_node->get_logger(),
+                "Could not look up %s <- %s (%s). Saving in the RAW %s frame, "
+                "which is NOT gravity-aligned -- a localization run against it "
+                "will produce a tilted map frame that disagrees with any 2D grid "
+                "built in %s.",
+                level_frame.c_str(), map_frame.c_str(), ex.what(),
+                map_frame.c_str(), level_frame.c_str());
+        }
+    }
+    batchMap->header.frame_id = saved_frame;
     pcl::io::savePCDFileBinary(save_directory + "map_batch.pcd", *batchMap);
 
     std::ostringstream msg;
@@ -1046,6 +1088,8 @@ int main(int argc, char **argv)
 	rclcpp::init(argc, argv);
 	g_node = std::make_shared<rclcpp::Node>("laserPGO");
 	g_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(g_node);
+	g_tf_buffer = std::make_shared<tf2_ros::Buffer>(g_node->get_clock());
+	g_tf_listener = std::make_shared<tf2_ros::TransformListener>(*g_tf_buffer);
 
     g_node->declare_parameter<std::string>("save_directory", "/");
     save_directory = g_node->get_parameter("save_directory").as_string();
@@ -1053,6 +1097,18 @@ int main(int argc, char **argv)
     // World frame for all published outputs (see map_frame declaration above).
     g_node->declare_parameter<std::string>("map_frame", "camera_init");
     map_frame = g_node->get_parameter("map_frame").as_string();
+
+    // The saved map is a LOCALIZATION PRIOR: whatever frame it is written in
+    // becomes the "map" frame of every downstream localization run. The raw
+    // PGO map frame is anchored to the LIO start pose, which on a tilted
+    // sensor mount is ~90 deg off gravity -- while the 2D occupancy grid built
+    // alongside it (octomap, frame_id map_level) is gravity-aligned and
+    // floor-referenced. Serving both as "map" then puts them ~90 deg apart.
+    // Saving in level_frame makes the .pcd and the 2D grid share one frame.
+    g_node->declare_parameter<std::string>("level_frame", "map_level");
+    level_frame = g_node->get_parameter("level_frame").as_string();
+    g_node->declare_parameter<bool>("save_in_level_frame", true);
+    save_in_level_frame = g_node->get_parameter("save_in_level_frame").as_bool();
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgScansDirectory = save_directory + "Scans/";
@@ -1122,6 +1178,17 @@ int main(int argc, char **argv)
     g_node->declare_parameter<double>("mapviz_filter_size", 0.4);
     double mapVizFilterSize = g_node->get_parameter("mapviz_filter_size").as_double();
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
+
+    // <= 0 means "same as mapviz_filter_size" (previous behaviour, one shared
+    // filter). Set it smaller than mapviz_filter_size to write a dense
+    // localization prior while keeping the RViz map cheap.
+    g_node->declare_parameter<double>("map_save_filter_size", -1.0);
+    double mapSaveFilterSize = g_node->get_parameter("map_save_filter_size").as_double();
+    if (mapSaveFilterSize <= 0.0) mapSaveFilterSize = mapVizFilterSize;
+    downSizeFilterMapSave.setLeafSize(mapSaveFilterSize, mapSaveFilterSize, mapSaveFilterSize);
+    RCLCPP_INFO(g_node->get_logger(),
+        "PGO map leaf sizes: rviz %.3f m, saved map_batch.pcd %.3f m",
+        mapVizFilterSize, mapSaveFilterSize);
 
     g_node->declare_parameter<std::string>("cloud_topic", "/cloud_registered_body");
     g_node->declare_parameter<std::string>("odom_topic", "/Odometry");

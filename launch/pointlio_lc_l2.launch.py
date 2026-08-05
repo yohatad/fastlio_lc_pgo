@@ -1,3 +1,23 @@
+# Point-LIO + PGO loop closure on the Pepper L2 rig -- the Point-LIO
+# equivalent of fastlio_lc_l2.launch.py (same file, FAST-LIO backend). See
+# that file for the detailed comments on why each piece is wired the way it
+# is; this only documents what's DIFFERENT for the Point-LIO backend.
+#
+# pgo_node's cloud_topic and odom_topic are plain overridable ROS parameters
+# (not hardcoded), and Point-LIO's registered-cloud topic name
+# (/cloud_registered_body) is IDENTICAL to FAST-LIO's -- only odom_topic
+# needs pointing at Point-LIO's /aft_mapped_to_init. No PGO/GTSAM source
+# changes needed for this swap.
+#
+# save_directory defaults to a SEPARATE path from fastlio_lc_l2.launch.py's:
+# PGO wipes its Scans/ subfolder on startup, so sharing a directory between
+# the two backends would let one destroy the other's saved keyframes/map.
+#
+# Usage:
+#   ros2 launch fastlio_lc_pgo pointlio_lc_l2.launch.py
+#   ros2 bag play <bag> --clock --topics /points /imu/data /tf_static
+#   (do NOT replay /tf -- see pepper_sensor_tf.launch.py's header)
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -12,7 +32,7 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    fast_lio_share = get_package_share_directory('fast_lio')
+    point_lio_share = get_package_share_directory('point_lio')
     pgo_share = get_package_share_directory('fastlio_lc_pgo')
     sensor_tf_share = get_package_share_directory('pepper_slam')
     default_rviz_cfg = os.path.join(pgo_share, 'rviz', 'fastlio_lc.rviz')
@@ -24,17 +44,22 @@ def generate_launch_description():
     occupancy = LaunchConfiguration('occupancy')
 
     declare_save_directory_cmd = DeclareLaunchArgument(
-        'save_directory', default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/',
-        description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
+        'save_directory', default_value='/home/yoha/Lidar/run_l2_lc_pointlio/pgo_output/',
+        description='Directory where PGO writes optimized poses, odom poses, times and '
+                    'keyframe scans (its Scans/ subfolder is wiped on startup). Kept '
+                    'separate from fastlio_lc_l2.launch.py\'s default so the two '
+                    'backends cannot wipe each other\'s saved runs.'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='false',
-        description='Launch RViz2 with both the raw FAST-LIO view and the loop-closure (PGO) view pre-configured '
-                     '(/aft_pgo_map, /aft_pgo_path, /loop_closure_constraints).'
+        description='Launch RViz2 with both the raw Point-LIO view and the loop-closure '
+                    '(PGO) view pre-configured (/aft_pgo_map, /aft_pgo_path, '
+                    '/loop_closure_constraints).'
     )
     declare_rviz_cfg_cmd = DeclareLaunchArgument(
         'rviz_cfg', default_value=default_rviz_cfg,
-        description='RViz config file path'
+        description='RViz config file path (shared with fastlio_lc_l2.launch.py -- '
+                    'the PGO topics it visualizes are the same regardless of backend).'
     )
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
@@ -46,18 +71,17 @@ def generate_launch_description():
                     'build a ray-traced 2D OccupancyGrid on /projected_map. Save it: '
                     'ros2 run nav2_map_server map_saver_cli -t /projected_map -f <name>'
     )
-    # Height band for the 2D projection, in the map (gravity-aligned)
-    # frame. map is now FLOOR-referenced (level_frame_on_floor in
-    # pgo_map_odom_bridge puts its z=0 on the ground plane instead of at the
-    # LIO start pose ~lidar-mount height up), so these are plain heights above
-    # the floor. They used to be -0.25/1.0 against a floor measured at
-    # ~-0.45 m; the same physical band is now 0.20/1.45.
+    # map is now FLOOR-referenced (level_frame_on_floor in
+    # pgo_map_odom_bridge), so these are simply heights above the ground and
+    # no longer carry a lidar-mount offset. Measured on the July_22 bag: floor
+    # plane lands at z ~= -0.02 m, room ceiling ~ +3.7 m.
     declare_occ_min_z_cmd = DeclareLaunchArgument(
         'occ_min_z', default_value='0.20',
         description='occupancy_min_z for octomap: height above the FLOOR (map '
                     'z=0 is the ground plane). Must stay above the floor or the '
                     'traversed floor is marked occupied (a black trail wherever the '
-                    'robot drives), while still catching low obstacles.'
+                    'robot drives); 0.20 keeps the clearance the old lidar-referenced '
+                    '-0.25 had, while still catching low obstacles.'
     )
     declare_occ_max_z_cmd = DeclareLaunchArgument(
         'occ_max_z', default_value='1.45',
@@ -67,30 +91,20 @@ def generate_launch_description():
     declare_self_hit_range_cmd = DeclareLaunchArgument(
         'self_hit_range', default_value='0.8',
         description='Drop scan points closer than this (m) before octomap, to remove '
-                    'the low lidar seeing Pepper self-hits (a black trail along the path).'
+                    'the low lidar seeing Pepper self-hits.'
     )
     declare_max_range_cmd = DeclareLaunchArgument(
         'max_range', default_value='20.0',
-        description='octomap sensor_model.max_range (m). Beams are only inserted/cleared '
-                    'out to this. Kept at full range for accuracy; clean the thin clearing-'
-                    'ray spokes off the FINISHED map with clean_occupancy_map.py instead.'
+        description='octomap sensor_model.max_range (m).'
     )
-    # Radius-outlier removal is OFF by default: the per-scan L2 cloud is sparse,
-    # so any neighbourly setting also deletes real far-wall returns (tested
-    # 3-in-0.25 m dropped ~60% of points), and it does NOT remove the clearing-
-    # ray spokes anyway (those come from real see-through observations, not spike
-    # endpoints -- use clean_occupancy_map.py for spokes). Enable ONLY if you see
-    # isolated occupied dots, and keep it loose (e.g. ror_radius:=0.5).
     declare_ror_neighbors_cmd = DeclareLaunchArgument(
         'ror_min_neighbors', default_value='0',
         description='Radius-outlier removal: drop scan points with fewer than this many '
-                    'neighbours within ror_radius. 0 = OFF (default). Only for isolated '
-                    'occupied dots; does NOT remove clearing-ray spokes.'
+                    'neighbours within ror_radius. 0 = OFF (default).'
     )
     declare_ror_radius_cmd = DeclareLaunchArgument(
         'ror_radius', default_value='0.5',
-        description='Radius (m) for radius-outlier removal neighbour count (keep large '
-                    'on the sparse per-scan cloud so real far returns are not deleted).'
+        description='Radius (m) for radius-outlier removal neighbour count.'
     )
     declare_mapviz_filter_size_cmd = DeclareLaunchArgument(
         'mapviz_filter_size', default_value='0.1',
@@ -119,8 +133,6 @@ def generate_launch_description():
     map_save_filter_size = LaunchConfiguration('map_save_filter_size')
 
     # Static sensor rig: base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams).
-    # This is the piece missing from the bag's own /tf; without it the FAST-LIO
-    # bridge cannot close odom -> base_footprint.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')
@@ -128,18 +140,17 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # FAST-LIO owns odom_lidar -> base_footprint (via lio_map_odom_bridge).
-    # bridge_level_frame:='false' disables the bridge's own leveled frame here
-    # because PGO owns map_lidar -> odom_lidar below; otherwise odom_lidar
-    # would get two parents. The leveling still happens, one level up:
-    # pgo_map_odom_bridge publishes map -> map_lidar, so the leveled frame in
-    # this stack is 'map' rather than 'odom'.
-    fast_lio_launch = IncludeLaunchDescription(
+    # Point-LIO owns odom_lidar -> base_footprint (via lio_map_odom_bridge,
+    # same as FAST-LIO's variant). bridge_level_frame:='false' for the same
+    # reason: PGO owns map_lidar -> odom_lidar below, so odom_lidar must keep a
+    # single parent. The leveling happens one level up instead --
+    # pgo_map_odom_bridge publishes map -> map_lidar -- so the leveled frame in
+    # this stack is 'map', not 'odom'.
+    point_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(fast_lio_share, 'launch', 'mapping.launch.py')
+            os.path.join(point_lio_share, 'launch', 'mapping_l2lidar_node.launch.py')
         ),
         launch_arguments={
-            'config_file': 'l2.yaml',
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
@@ -147,9 +158,8 @@ def generate_launch_description():
         }.items()
     )
 
-    # PGO owns the loop-closure correction map -> odom, completing the REP-105
-    # tree:  map -> odom -> base_footprint -> l2lidar_frame -> l2lidar_frame_imu.
-    # It also publishes the one-time upright frame map (RViz fixed frame).
+    # PGO owns the loop-closure correction map -> odom, same as the FAST-LIO
+    # variant -- odom_topic is the only thing that changes for Point-LIO.
     pgo_map_odom_bridge = Node(
         package='fast_lio',
         executable='pgo_map_odom_bridge.py',
@@ -161,25 +171,18 @@ def generate_launch_description():
             'odom_frame': 'odom_lidar',
             'base_frame': 'base_footprint',
             'level_frame': 'map',
-            'odom_topic': '/Odometry',
+            'odom_topic': '/aft_mapped_to_init',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
         }],
     )
 
-    # Ray-traced 2D occupancy grid via octomap_server. It consumes the PER-SCAN
-    # cloud /cloud_registered_body (body frame l2lidar_frame_imu) and, using our
-    # corrected TF (map -> odom -> base_footprint -> l2lidar_frame_imu), clears free
-    # space by casting rays from each scan's sensor origin -- which a top-down
-    # projection of the accumulated /aft_pgo_map cannot do. The octree is built
-    # in the gravity-aligned map frame so the down-projection is level.
-    # Publishes nav_msgs/OccupancyGrid on /projected_map.
-    # NOTE: octomap inserts scans online and does not retro-correct already-
-    # inserted voxels, so a LARGE loop closure leaves a seam; rebuild from
-    # corrected keyframes if that matters. For room/corridor drift it is fine.
-    # Strip robot self-hits (near-field cluster within ~0.6 m of the low lidar)
-    # from the scan before octomap; otherwise they print as a black trail along
-    # the path. Only octomap consumes the filtered cloud; SLAM is untouched.
+    # NOTE: /cloud_registered_body must carry a frame_id that actually exists
+    # in the TF tree, or octomap_server's tf2 MessageFilter drops every scan
+    # and /projected_map stays empty forever. Point-LIO upstream hardcoded it
+    # to the nonexistent "body"; it is now the publish.body_frame parameter,
+    # set to l2lidar_frame_imu in point_lio/config/l2lidar_node.yaml (mirroring
+    # FAST_LIO/config/l2.yaml). Nothing needed here.
     range_filter_node = Node(
         package='fast_lio',
         executable='cloud_range_filter.py',
@@ -209,39 +212,23 @@ def generate_launch_description():
             'base_frame_id': 'base_footprint',
             'resolution': 0.05,
             'sensor_model.max_range': max_range,
-            # Drop isolated single occupied voxels (stray beam noise / reflections /
-            # points seen through wall gaps) so they don't pepper the map outside walls.
             'filter_speckles': True,
             'occupancy_min_z': occ_min_z,
             'occupancy_max_z': occ_max_z,
-            # Segment the floor as ground (free) instead of obstacle. The map has
-            # a residual ~1.5 deg tilt (FAST-LIO pitch drift), so a fixed z-band
-            # alone can't separate floor from low obstacles across the whole map;
-            # plane segmentation classifies the ground locally regardless of tilt.
-            # Runs in base_frame_id (base_footprint), which sits ON the floor.
             'filter_ground_plane': True,
-            'ground_filter.distance': 0.05,       # inlier band around fitted plane
-            'ground_filter.angle': 0.15,          # rad; tolerant of the ~1.5 deg tilt
-            'ground_filter.plane_distance': 0.12,  # plane must be within this of base z=0
+            'ground_filter.distance': 0.05,
+            'ground_filter.angle': 0.15,
+            'ground_filter.plane_distance': 0.12,
             'latch': True,
         }],
     )
 
-    # Historical note: this used to need an LD_LIBRARY_PATH override to avoid
-    # loading an ABI-incompatible GTSAM at runtime (a stale apt libgtsam4
-    # 4.1.1 the binary was originally compiled against, vs. ros-humble-gtsam
-    # 4.2.0 installed alongside it). That apt package no longer exists on
-    # this system at all -- confirmed via `dpkg -l | grep gtsam` finding only
-    # ros-humble-gtsam, and a rebuild of this package now links pgo_node
-    # against ros-humble-gtsam 4.2.0 directly (confirmed via `ldd`), with no
-    # override needed. Re-adding an LD_LIBRARY_PATH override here would
-    # actively BREAK it again: this machine also has a second, differently-
-    # built GTSAM 4.2.0 at /usr/local/lib (undefined symbol on
-    # NonlinearFactor::rekey when loaded instead -- a TBB build-config
-    # mismatch, not a version mismatch). If this starts crashing again after
-    # a future system change, check `ldd pgo_node | grep gtsam` before
-    # reaching for an env override -- confirm which GTSAM it actually needs
-    # first.
+    # No LD_LIBRARY_PATH override -- pgo_node is the identical executable
+    # regardless of which LIO backend's topics it's pointed at, and a fresh
+    # rebuild links it against ros-humble-gtsam 4.2.0 directly. See
+    # fastlio_lc_l2.launch.py's comment at the equivalent spot for the full
+    # story (a stale apt libgtsam4 4.1.1 this used to need is gone from this
+    # system; forcing a different GTSAM here now BREAKS it instead).
     pgo_node = Node(
         package='fastlio_lc_pgo',
         executable='pgo_node',
@@ -250,24 +237,13 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
-            'cloud_topic': '/cloud_registered_body',
-            'odom_topic': '/Odometry',
-
-            # PGO's optimized map/path/odom live in the loop-closure-corrected
-            # "map" frame; pgo_map_odom_bridge turns the offset between this and
-            # FAST-LIO's odom into the REP-105 map -> odom transform.
+            'cloud_topic': '/cloud_registered_body',  # Point-LIO's name matches FAST-LIO's
+            'odom_topic': '/aft_mapped_to_init',       # only this differs from the FAST-LIO variant
             'map_frame': 'map_lidar',
-
-            # keyframe selection
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
-
-            # Scan Context (indoor, Unitree L2: 30 m det_range -> same
-            # indoor radius as the corridor benchmark run)
             'sc_dist_thres': 0.4,
             'sc_max_radius': 20.0,
-
-            # loop closure
             'historyKeyframeSearchRadius': 1.5,
             'historyKeyframeSearchTimeDiff': 30.0,
             'historyKeyframeSearchNum': 20,
@@ -298,7 +274,7 @@ def generate_launch_description():
     ld.add_action(declare_mapviz_filter_size_cmd)
     ld.add_action(declare_map_save_filter_size_cmd)
     ld.add_action(sensor_tf_launch)
-    ld.add_action(fast_lio_launch)
+    ld.add_action(point_lio_launch)
     ld.add_action(pgo_node)
     ld.add_action(pgo_map_odom_bridge)
     ld.add_action(range_filter_node)
