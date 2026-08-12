@@ -161,7 +161,7 @@ def generate_launch_description():
             'odom_frame': 'odom_lidar',
             'base_frame': 'base_footprint',
             'level_frame': 'map',
-            'odom_topic': '/Odometry',
+            'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
         }],
@@ -251,7 +251,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
             'cloud_topic': '/cloud_registered_body',
-            'odom_topic': '/Odometry',
+            'odom_topic': '/odom_lio',
 
             # PGO's optimized map/path/odom live in the loop-closure-corrected
             # "map" frame; pgo_map_odom_bridge turns the offset between this and

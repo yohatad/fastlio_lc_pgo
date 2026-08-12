@@ -171,7 +171,7 @@ def generate_launch_description():
             'odom_frame': 'odom_lidar',
             'base_frame': 'base_footprint',
             'level_frame': 'map',
-            'odom_topic': '/aft_mapped_to_init',
+            'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
         }],
@@ -238,11 +238,30 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
             'cloud_topic': '/cloud_registered_body',  # Point-LIO's name matches FAST-LIO's
-            'odom_topic': '/aft_mapped_to_init',       # only this differs from the FAST-LIO variant
+            'odom_topic': '/odom_lio',       # only this differs from the FAST-LIO variant
             'map_frame': 'map_lidar',
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
-            'sc_dist_thres': 0.4,
+            # LOOP-CLOSURE ACCEPTANCE GATES, tightened 2026-08-10 after a run on
+            # bag/slam_august_8_bag folded the map. The three values below had
+            # drifted apart from the pgo_node defaults in the permissive
+            # direction ALL AT ONCE, which is what let bad closures both get in
+            # and dominate:
+            #   sc_dist_thres              0.4 vs default 0.2  (2x looser detector)
+            #   loopFitnessScoreThreshold  0.3 vs default 0.3  (loose ICP gate)
+            #   loopNoiseScore             0.1 vs default 0.5  (5x MORE trusted)
+            # Observed in that run: closures accepted at ICP fitness 0.151, 0.178
+            # and 0.081 alongside rejects at 0.359/0.488 -- i.e. sitting right on
+            # the gate -- with query keyframes repeatedly matching one old node
+            # (89 -> 379/380/381, 220 -> 449..457). Indoor corridors are
+            # self-similar and the L2 gives only ~5.3k points per scan, so Scan
+            # Context descriptors are weak here and false positives are expected;
+            # the gates, not the detector, are what must be strict.
+            #
+            # There IS a Cauchy robust kernel on loop factors
+            # (laserPosegraphOptimization.cpp:303-305), but at variance 0.1 it
+            # cannot absorb a wrong constraint -- hence raising loopNoiseScore too.
+            'sc_dist_thres': 0.2,   # was 0.4 -- back to the pgo_node default
             'sc_max_radius': 20.0,
             'historyKeyframeSearchRadius': 1.5,
             'historyKeyframeSearchTimeDiff': 30.0,
@@ -251,9 +270,15 @@ def generate_launch_description():
             'loopClosureFrequency': 4.0,
             'graphUpdateFrequency': 2.0,
             'graphUpdateTimes': 5,
-            'loopNoiseScore': 0.1,
+            # was 0.1: GTSAM variance on loop factors. LOWER = trusted MORE, so
+            # 0.1 made every accepted closure pull 5x harder than the pgo_node
+            # default (0.5). 0.3 still favours closures over odometry without
+            # letting a single bad one yank the graph. See the gate note above.
+            'loopNoiseScore': 0.3,
             'vizmapFrequency': 10.0,
-            'loopFitnessScoreThreshold': 0.3,
+            # was 0.3: ICP fitness gate. 0.15 rejects the marginal 0.151/0.178
+            # passes seen in the folded run while keeping the clean 0.02-0.08 ones.
+            'loopFitnessScoreThreshold': 0.15,
             'mapviz_filter_size': mapviz_filter_size,
             'map_save_filter_size': map_save_filter_size,
         }],
