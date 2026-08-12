@@ -264,19 +264,46 @@ def generate_launch_description():
 
             # Scan Context (indoor, Unitree L2: 30 m det_range -> same
             # indoor radius as the corridor benchmark run)
+            # NOTE these two are currently INERT: performSCLoopClosure() exists
+            # but is never called -- process_lcd() only runs the radius search.
+            # The descriptors are still computed for every keyframe, so the cost
+            # is paid and nothing reads the result.
             'sc_dist_thres': 0.4,
             'sc_max_radius': 20.0,
 
             # loop closure
+            # 1.5 m is tight, but detection now runs on the OPTIMISED poses, so
+            # it no longer has to absorb the whole accumulated drift.
             'historyKeyframeSearchRadius': 1.5,
+            # 30 s of Pepper's indoor travel can be well under 10 m, so short
+            # values let near-in-time revisits (pausing, turning on the spot)
+            # register as "loops". Raise if the graph fills with trivial edges.
             'historyKeyframeSearchTimeDiff': 30.0,
             'historyKeyframeSearchNum': 20,
             'speedFactor': 1.0,
             'loopClosureFrequency': 4.0,
             'graphUpdateFrequency': 2.0,
             'graphUpdateTimes': 5,
-            'loopNoiseScore': 0.1,
-            'vizmapFrequency': 10.0,
+            # 2026-08-12: 0.1 -> 0.01. initNoises() gives each odometry edge
+            # 1e-6 rad^2 / 1e-4 m^2, so over a 100-keyframe loop the chain
+            # accumulates ~1e-4 rad^2 / 1e-2 m^2. A loop factor at 0.1 was one
+            # to three orders LOOSER than the chain it was meant to correct, so
+            # iSAM2 kept the odometry and barely moved the graph -- worst for
+            # rotation, which is the dominant indoor error mode. 0.01 puts the
+            # loop factor at the chain's translational scale.
+            # NB robustLoopNoise wraps this in a Cauchy m-estimator, which
+            # downweights large residuals further, so the effective correction
+            # is softer than the raw variance ratio suggests. Validate on a run
+            # with a known revisit before trusting the number.
+            'loopNoiseScore': 0.01,
+            # 2026-08-12: 10.0 -> 0.1 (the node's own default). pubMap() rebuilds
+            # the ENTIRE map every call -- local2global over every keyframe, then
+            # a voxel filter over the whole accumulated cloud -- while holding
+            # mKF. At 10 Hz and a few hundred keyframes it cannot keep up, so it
+            # spins continuously holding the lock, starving keyframe insertion,
+            # updatePoses and the ICP thread while odometryBuf/fullResBuf grow
+            # unbounded.
+            'vizmapFrequency': 0.1,
             'loopFitnessScoreThreshold': 0.3,
             'mapviz_filter_size': mapviz_filter_size,
             'map_save_filter_size': map_save_filter_size,

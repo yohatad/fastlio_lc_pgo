@@ -22,6 +22,8 @@
 #include <iostream>
 #include <string>
 #include <optional>
+#include <filesystem>   // save_directory handling, replacing system("rm -r")
+#include <cstdlib>      // getenv, for the save_directory default
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -365,6 +367,17 @@ pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::P
 
 void pubPath( void )
 {
+    // LOCAL FIX: bail before publishing anything when no keyframe has been
+    // optimised yet. The loop below runs node_idx < recentIdxUpdated, so at
+    // recentIdxUpdated == 0 it never executes and the DEFAULT-CONSTRUCTED
+    // odomAftPGO went out: position (0,0,0), quaternion (0,0,0,0) -- not a unit
+    // quaternion -- and stamp 0, followed by a TF carrying the same. Downstream
+    // pgo_map_odom_bridge.py does not validate it: pose_to_matrix falls back to
+    // identity rotation on the degenerate quaternion and latches a bogus
+    // map_lidar -> odom_lidar correction until the next PGO update.
+    if (recentIdxUpdated <= 0)
+        return;
+
     // pub odom and path
     nav_msgs::msg::Odometry odomAftPGO;
     nav_msgs::msg::Path pathAftPGO;
@@ -483,10 +496,13 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     nearKeyframes->clear();
     for (int i = -submap_size; i <= submap_size; ++i) {
         int keyNear = root_idx + i;
-        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
-            continue;
-
+        // LOCAL FIX: the bound was read outside mKF while the lock was taken
+        // only for the access itself, so the size could change between the two.
         mKF.lock();
+        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) ) {
+            mKF.unlock();
+            continue;
+        }
         *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
         mKF.unlock();
     }
@@ -504,13 +520,15 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
 void loopFindNearKeyframes(pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& searchNum)
 {
     nearKeyframes->clear();
-    int cloudSize = keyframeLaserClouds.size();
     for (int i = -searchNum; i <= searchNum; ++i)
     {
         int keyNear = key + i;
-        if (keyNear < 0 || keyNear >= cloudSize )
-            continue;
+        // LOCAL FIX: cloudSize was cached from an unlocked read before the loop.
         mKF.lock();
+        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) ) {
+            mKF.unlock();
+            continue;
+        }
         *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
         mKF.unlock();
     }
@@ -556,7 +574,12 @@ gtsam::Pose3 doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 
     // ICP Settings
     pcl::IterativeClosestPoint<PointType, PointType> icp;
-    icp.setMaxCorrespondenceDistance(150);
+    // LOCAL FIX: was a flat 150 m, against a 1.5 m detection radius. That let
+    // ICP draw correspondences from anywhere in the +/-historyKeyframeSearchNum
+    // submap, widening the basin for confident WRONG convergence. LIO-SAM uses
+    // ~2x the search radius; scaling keeps the two coupled if the radius is
+    // retuned. Floored so a very small radius cannot starve the first iteration.
+    icp.setMaxCorrespondenceDistance(std::max(2.0 * historyKeyframeSearchRadius, 5.0));
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
@@ -585,12 +608,18 @@ gtsam::Pose3 doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
     Eigen::Affine3f correctionLidarFrame;
     correctionLidarFrame = icp.getFinalTransformation();
 
-    Eigen::Affine3f tWrong = Pose6dToAffine3f(keyframePosesUpdated[_curr_kf_idx]);
+    // LOCAL FIX: both of these indexed keyframePosesUpdated without mKF.
+    mKF.lock();
+    Pose6D currPose = keyframePosesUpdated[_curr_kf_idx];
+    Pose6D loopPose = keyframePosesUpdated[_loop_kf_idx];
+    mKF.unlock();
+
+    Eigen::Affine3f tWrong = Pose6dToAffine3f(currPose);
 
     Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;
     pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
     gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-    gtsam::Pose3 poseTo =  Pose6dTogtsamPose3(keyframePosesUpdated[_loop_kf_idx]);
+    gtsam::Pose3 poseTo =  Pose6dTogtsamPose3(loopPose);
 
     return poseFrom.between(poseTo);
 } // doICPVirtualRelative
@@ -790,7 +819,19 @@ bool detectLoopClosureDistance(int *loopKeyCur, int *loopKeyPre)
     if (it != loopIndexContainer.end())
         return false;
 
-    pcl::PointCloud<pcl::PointXYZ>::Ptr copy_cloudKeyPoses3D = vector2pc(keyframePoses);
+    // LOCAL FIX: search the OPTIMISED poses, not the raw odometry chain.
+    // keyframePoses is never touched by iSAM2, so detection saw the full
+    // accumulated drift: with historyKeyframeSearchRadius 1.5 m a revisit was
+    // only found once drift was already under 1.5 m -- i.e. precisely when loop
+    // closure was not needed. It was also inconsistent with
+    // doICPVirtualRelative(), which builds its submaps from keyframePosesUpdated
+    // (see :588/:593), so detection and verification disagreed about where the
+    // robot was. Upstream LIO-SAM / FAST_LIO_LC both search the corrected poses.
+    mKF.lock();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr copy_cloudKeyPoses3D = vector2pc(keyframePosesUpdated);
+    std::vector<double> copy_keyframeTimes = keyframeTimes;
+    mKF.unlock();
+    if (copy_cloudKeyPoses3D->empty()) return false;
     std::vector<int> pointSearchIndLoop;
     std::vector<float> pointSearchSqDisLoop;
     kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D);
@@ -799,7 +840,9 @@ bool detectLoopClosureDistance(int *loopKeyCur, int *loopKeyPre)
     for(int i = 0; i < pointSearchIndLoop.size(); ++i)
     {
         int id = pointSearchIndLoop[i];
-        if ( abs( keyframeTimes[id] - keyframeTimes[*loopKeyCur] ) > historyKeyframeSearchTimeDiff )
+        if ( id >= int(copy_keyframeTimes.size()) || *loopKeyCur >= int(copy_keyframeTimes.size()) )
+            continue;
+        if ( abs( copy_keyframeTimes[id] - copy_keyframeTimes[*loopKeyCur] ) > historyKeyframeSearchTimeDiff )
         {
             *loopKeyPre = id;
             break;
@@ -814,30 +857,54 @@ bool detectLoopClosureDistance(int *loopKeyCur, int *loopKeyPre)
 
 void performRSLoopClosure(void)
 {
-    if( keyframePoses.empty() )
+    // LOCAL FIX: size/back() were read without mKF while process_pg push_backs
+    // into these vectors. A reallocation mid-read is a use-after-free.
+    mKF.lock();
+    const int numKeyframes = int(keyframePoses.size());
+    mKF.unlock();
+    if( numKeyframes == 0 )
         return;
 
-    int loopKeyCur = keyframePoses.size() - 1;
+    int loopKeyCur = numKeyframes - 1;
     int loopKeyPre = -1;
     if ( detectLoopClosureDistance(&loopKeyCur, &loopKeyPre) ){
         cout << "Loop detected! - between " << loopKeyPre << " and " << loopKeyCur << "" << endl;
         mBuf.lock();
         scLoopICPBuf.push(std::pair<int, int>(loopKeyPre, loopKeyCur));
-        loopIndexContainer[loopKeyCur] = loopKeyPre ;
         mBuf.unlock();
+        // LOCAL FIX: the loopIndexContainer insert used to happen HERE, before
+        // ICP had verified anything. detectLoopClosureDistance()'s early-out
+        // treats any key present in that map as already handled, so a candidate
+        // that ICP then rejected on fitness blacklisted its keyframe FOREVER --
+        // and visualizeLoopClosure() drew a marker edge for a constraint that
+        // was never added to the graph. It is now inserted in process_icp()
+        // only after the fitness test passes.
     } else
         return;
 } // performRSLoopClosure
 
 void visualizeLoopClosure()
 {
-    if (loopIndexContainer.empty())
+    // LOCAL FIX: loopIndexContainer, keyframeTimes and keyframePosesUpdated
+    // were all read here with no lock while process_pg / process_icp were
+    // writing them. Snapshot once under the locks, then build markers from the
+    // copies -- a reallocating push_back mid-iteration is a use-after-free.
+    mBuf.lock();
+    std::map<int, int> loopPairs = loopIndexContainer;
+    mBuf.unlock();
+    if (loopPairs.empty())
         return;
+
+    mKF.lock();
+    if (keyframeTimes.empty()) { mKF.unlock(); return; }
+    const double lastKeyframeTime = keyframeTimes.back();
+    std::vector<Pose6D> posesSnapshot = keyframePosesUpdated;
+    mKF.unlock();
 
     visualization_msgs::msg::MarkerArray markerArray;
     visualization_msgs::msg::Marker markerNode;
     markerNode.header.frame_id = map_frame;
-    markerNode.header.stamp = secToStamp(keyframeTimes.back());
+    markerNode.header.stamp = secToStamp(lastKeyframeTime);
     markerNode.action = visualization_msgs::msg::Marker::ADD;
     markerNode.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     markerNode.ns = "loop_nodes";
@@ -848,7 +915,7 @@ void visualizeLoopClosure()
     markerNode.color.a = 1;
     visualization_msgs::msg::Marker markerEdge;
     markerEdge.header.frame_id = map_frame;
-    markerEdge.header.stamp = secToStamp(keyframeTimes.back());
+    markerEdge.header.stamp = secToStamp(lastKeyframeTime);
     markerEdge.action = visualization_msgs::msg::Marker::ADD;
     markerEdge.type = visualization_msgs::msg::Marker::LINE_LIST;
     markerEdge.ns = "loop_edges";
@@ -858,19 +925,23 @@ void visualizeLoopClosure()
     markerEdge.color.r = 0.9; markerEdge.color.g = 0.9; markerEdge.color.b = 0;
     markerEdge.color.a = 1;
 
-    for (auto it = loopIndexContainer.begin(); it != loopIndexContainer.end(); ++it)
+    for (auto it = loopPairs.begin(); it != loopPairs.end(); ++it)
     {
         int key_cur = it->first;
         int key_pre = it->second;
+        // The snapshot can lag loopPairs by an insert; skip rather than index OOB.
+        if (key_cur < 0 || key_pre < 0 ||
+            key_cur >= int(posesSnapshot.size()) || key_pre >= int(posesSnapshot.size()))
+            continue;
         geometry_msgs::msg::Point p;
-        p.x = keyframePosesUpdated[key_cur].x;
-        p.y = keyframePosesUpdated[key_cur].y;
-        p.z = keyframePosesUpdated[key_cur].z;
+        p.x = posesSnapshot[key_cur].x;
+        p.y = posesSnapshot[key_cur].y;
+        p.z = posesSnapshot[key_cur].z;
         markerNode.points.push_back(p);
         markerEdge.points.push_back(p);
-        p.x = keyframePosesUpdated[key_pre].x;
-        p.y = keyframePosesUpdated[key_pre].y;
-        p.z = keyframePosesUpdated[key_pre].z;
+        p.x = posesSnapshot[key_pre].x;
+        p.y = posesSnapshot[key_pre].y;
+        p.z = posesSnapshot[key_pre].z;
         markerNode.points.push_back(p);
         markerEdge.points.push_back(p);
     }
@@ -913,6 +984,12 @@ void process_icp(void)
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(curr_node_idx, prev_node_idx, relative_pose, robustLoopNoise));
                 mtxPosegraph.unlock();
+                // Record the accepted pair only now -- see performRSLoopClosure().
+                // A rejected candidate must stay eligible so a later revisit,
+                // with better overlap, can be retried.
+                mBuf.lock();
+                loopIndexContainer[curr_node_idx] = prev_node_idx;
+                mBuf.unlock();
             }
         }
 
@@ -922,6 +999,12 @@ void process_icp(void)
     }
 } // process_icp
 
+// NOT STARTED by main(), and deliberately left that way. pubPath() is already
+// called from process_isam() after every optimisation, so /aft_pgo_odom and
+// /aft_pgo_path update at graphUpdateFrequency (2 Hz) -- running this thread as
+// well would publish the same poses twice and double the TF broadcast on
+// map_frame -> aft_pgo. vizPathFrequency is therefore unused. Kept for upstream
+// diff parity; delete both if that stops mattering.
 void process_viz_path(void)
 {
     float hz = vizPathFrequency;
@@ -1091,8 +1174,23 @@ int main(int argc, char **argv)
 	g_tf_buffer = std::make_shared<tf2_ros::Buffer>(g_node->get_clock());
 	g_tf_listener = std::make_shared<tf2_ros::TransformListener>(*g_tf_buffer);
 
-    g_node->declare_parameter<std::string>("save_directory", "/");
+    // LOCAL FIX: default was "/". Combined with the rm -r below that meant a
+    // bare `ros2 run` (no launch file to override it) would try to delete
+    // /Scans/ and write pose logs into the filesystem root. Defaulting under
+    // the user's cache directory makes the unconfigured case harmless.
+    {
+        const char *home = std::getenv("HOME");
+        std::string default_save = std::string(home ? home : "/tmp") + "/.cache/fastlio_lc_pgo/";
+        g_node->declare_parameter<std::string>("save_directory", default_save);
+    }
     save_directory = g_node->get_parameter("save_directory").as_string();
+    if (save_directory.empty() || save_directory == "/") {
+        RCLCPP_ERROR(g_node->get_logger(),
+            "save_directory '%s' refuses to be used: this node deletes "
+            "<save_directory>/Scans recursively at startup.", save_directory.c_str());
+        return 1;
+    }
+    if (save_directory.back() != '/') save_directory += '/';
 
     // World frame for all published outputs (see map_frame declaration above).
     g_node->declare_parameter<std::string>("map_frame", "camera_init");
@@ -1115,8 +1213,19 @@ int main(int argc, char **argv)
     // create the save directory (and wipe/recreate its Scans/ subfolder) before
     // opening any output streams under it - times.txt lives directly in
     // save_directory, so this must happen first or the open silently fails.
-    auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
-    unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+    // LOCAL FIX: was an unquoted `system("exec rm -r " + pgScansDirectory)`, so
+    // any space or shell metacharacter in save_directory changed what got
+    // deleted. std::filesystem does the same job without a shell.
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(pgScansDirectory, ec);
+        std::filesystem::create_directories(pgScansDirectory, ec);
+        if (ec) {
+            RCLCPP_ERROR(g_node->get_logger(), "Cannot create %s: %s",
+                         pgScansDirectory.c_str(), ec.message().c_str());
+            return 1;
+        }
+    }
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out);
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
 
@@ -1171,7 +1280,16 @@ int main(int argc, char **argv)
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
 
-    float filter_size = 0.4;
+    // LOCAL FIX: this leaf size was hardcoded at 0.4 m, and it is applied to
+    // every keyframe BEFORE the cloud is stored in keyframeLaserClouds (see
+    // process_pg). Everything downstream -- the RViz map, map_batch.pcd, the
+    // ICP submaps -- is therefore built from 0.4 m data, which is why asking
+    // for map_save_filter_size 0.05 could not produce a dense localization
+    // prior: the resolution was already gone. FAST-LIO's own filter_size_surf
+    // (0.25 on the L2) is the real floor, so values below that gain nothing.
+    // Kept at 0.4 by default to preserve existing behaviour.
+    g_node->declare_parameter<double>("keyframe_filter_size", 0.4);
+    float filter_size = float(g_node->get_parameter("keyframe_filter_size").as_double());
     downSizeFilterScancontext.setLeafSize(filter_size, filter_size, filter_size);
     downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
 
@@ -1230,6 +1348,22 @@ int main(int argc, char **argv)
 
  	rclcpp::spin(g_node);
  	rclcpp::shutdown();
+
+	// LOCAL FIX: join before returning. Every one of these threads loops on
+	// rclcpp::ok(), so shutdown() above ends them -- but without the joins their
+	// destructors ran while still joinable, which is std::terminate(), i.e. the
+	// node aborted on every clean Ctrl-C. Flush the time log too; it was never
+	// closed explicitly.
+	posegraph_slam.join();
+	lc_detection.join();
+	icp_calculation.join();
+	isam_update.join();
+	viz_map.join();
+
+	if (pgTimeSaveStream.is_open()) {
+		pgTimeSaveStream.flush();
+		pgTimeSaveStream.close();
+	}
 
 	return 0;
 }
