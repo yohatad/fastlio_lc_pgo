@@ -27,6 +27,31 @@ def generate_launch_description():
         'save_directory', default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/',
         description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
     )
+    # 2026-08-12: was hardcoded to l2.yaml, i.e. the L2's own IMU. That gyro
+    # cancels rotation about the gravity axis below ~16 deg/s and cost 139 deg
+    # of heading over a 744 s run (utils/L2_IMU/REPORT.md), so loop closure was
+    # being asked to repair odometry with a known, large, systematic yaw error.
+    # l2_rsimu.yaml drives the same estimator from the RealSense IMU instead;
+    # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst.
+    declare_lio_config_file_cmd = DeclareLaunchArgument(
+        'lio_config_file', default_value='l2_rsimu.yaml',
+        description='FAST-LIO config. l2_rsimu.yaml uses the RealSense IMU '
+                    '(recommended); l2.yaml uses the L2 s own.'
+    )
+    # Must match the IMU the config selects, or lio_map_odom_bridge closes
+    # odom -> base_footprint through the wrong static frame.
+    declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
+        'lidar_imu_frame', default_value='camera_imu_optical_frame',
+        description='Static frame the estimated body corresponds to. '
+                    'camera_imu_optical_frame for l2_rsimu.yaml, '
+                    'l2lidar_frame_imu for l2.yaml.'
+    )
+    declare_sensor_tf_scope_cmd = DeclareLaunchArgument(
+        'sensor_tf_scope', default_value='all', choices=['mount', 'all'],
+        description="'all' publishes the camera edges too, needed for bag "
+                    "replay where no RealSense driver is running. Use 'mount' "
+                    "on the real robot so the driver's own values win."
+    )
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='false',
         description='Launch RViz2 with both the raw FAST-LIO view and the loop-closure (PGO) view pre-configured '
@@ -121,11 +146,18 @@ def generate_launch_description():
     # Static sensor rig: base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams).
     # This is the piece missing from the bag's own /tf; without it the FAST-LIO
     # bridge cannot close odom -> base_footprint.
+    # scope:=all is required for BAG REPLAY. pepper_sensor_tf's default 'mount'
+    # scope omits the owner:driver camera edges on the assumption the RealSense
+    # driver is publishing them live; with no driver the tree comes up as
+    # disconnected islands and camera_imu_optical_frame -- which l2_rsimu.yaml
+    # names as the body frame -- does not resolve at all. Use 'mount' on the
+    # real robot so the driver's device-read values win.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')
         ),
-        launch_arguments={'use_sim_time': use_sim_time}.items()
+        launch_arguments={'use_sim_time': use_sim_time,
+                          'scope': LaunchConfiguration('sensor_tf_scope')}.items()
     )
 
     # FAST-LIO owns odom_lidar -> base_footprint (via lio_map_odom_bridge).
@@ -139,7 +171,8 @@ def generate_launch_description():
             os.path.join(fast_lio_share, 'launch', 'mapping.launch.py')
         ),
         launch_arguments={
-            'config_file': 'l2.yaml',
+            'config_file': LaunchConfiguration('lio_config_file'),
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
@@ -322,6 +355,9 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_save_directory_cmd)
+    ld.add_action(declare_lio_config_file_cmd)
+    ld.add_action(declare_lidar_imu_frame_cmd)
+    ld.add_action(declare_sensor_tf_scope_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
