@@ -338,6 +338,37 @@ def generate_launch_description():
             # downweights large residuals further, so the effective correction
             # is softer than the raw variance ratio suggests. Validate on a run
             # with a known revisit before trusting the number.
+            # Split rotation from translation, mirroring odomNoise's own 100x
+            # split (1e-6 rad^2 / 1e-4 m^2 per edge). A single scalar across all
+            # six DOF cannot sit correctly against both: MEASURED on this bag
+            # with the L2 IMU at a uniform 0.01, translation got ~50% of the
+            # loop error but rotation only ~1%, and the endpoint improved just
+            # 0.735 -> 0.579 m. Each value now sits at its own chain's
+            # accumulated scale over a ~100-keyframe loop.
+            # loopNoiseScore below is the legacy uniform fallback, unused while
+            # both of these are positive.
+            # MEASURED and NOT adopted: 1e-4 / 1e-2 was tried on this bag with
+            # l2.yaml and did NOT beat the uniform 0.01 -- correction fell to
+            # 0.330 m / 2.49 deg from 0.475 m / 2.76 deg, and the endpoint gained
+            # only 1.7% against 21.1%. That comparison is CONFOUNDED, though: the
+            # two runs' RAW odometry differed (end error 0.735 vs 0.985 m, path
+            # 165.37 vs 165.73 m) because FAST-LIO replay is nondeterministic, so
+            # PGO saw different input and the run-to-run variance exceeds the
+            # effect. Treat the numbers as inconclusive, not as evidence against.
+            #
+            # If the effect is real, the likely cause is the Cauchy kernel:
+            # tightening the variance makes each residual larger IN SIGMAS, and
+            # Cauchy downweights large normalised residuals harder, so
+            # over-trusting a loop factor can reduce its realised influence.
+            #
+            # To settle it, remove the nondeterminism: record FAST-LIO's
+            # /odom_lio and /cloud_registered_body ONCE, then replay that fixed
+            # recording into PGO for each candidate setting, so every arm sees
+            # byte-identical input.
+            #
+            # -1.0 means "fall back to loopNoiseScore", i.e. the uniform value.
+            'loopNoiseScoreRot': -1.0,
+            'loopNoiseScoreTrans': -1.0,
             'loopNoiseScore': 0.01,
             # 2026-08-12: 10.0 -> 0.1 (the node's own default). pubMap() rebuilds
             # the ENTIRE map every call -- local2global over every keyframe, then

@@ -185,7 +185,8 @@ int historyKeyframeSearchNum;
 double loopClosureFrequency;
 int graphUpdateTimes;
 double graphUpdateFrequency;
-double loopNoiseScore;
+double loopNoiseScore;           // legacy uniform value; used only as the fallback for the split pair below
+double loopNoiseScoreRot, loopNoiseScoreTrans;
 double vizmapFrequency;
 double vizPathFrequency;
 double speedFactor;
@@ -301,8 +302,28 @@ void initNoises( void )
     odomNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4;
     odomNoise = noiseModel::Diagonal::Variances(odomNoiseVector6);
 
+    // LOCAL FIX: split rotation from translation, mirroring odomNoise above.
+    //
+    // Upstream applied one scalar to all six DOF while odomNoise splits them a
+    // hundredfold (1e-6 rad^2 vs 1e-4 m^2), so no single value could sit
+    // correctly against both. iSAM2 weights a loop factor against the chain it
+    // has to overcome, roughly sigma2_chain / (sigma2_chain + sigma2_loop) over
+    // an N-keyframe loop. MEASURED on bag/slam_august_8_bag with the L2 IMU
+    // (which drifts, so there is real error to correct) at a uniform 0.01:
+    //   translation  chain ~1e-2 vs loop 1e-2  -> ~50% corrected, 0.475 m mean
+    //   rotation     chain ~1e-4 vs loop 1e-2  -> ~1%  corrected, 2.76 deg mean
+    // and the endpoint moved 0.735 -> 0.579 m, i.e. only 21% of the loop error
+    // came out -- yaw was still barely being touched, which is the dominant
+    // indoor error mode.
+    //
+    // Defaults below put each component at its own chain's scale. Note
+    // robustLoopNoise wraps these in a Cauchy m-estimator, which downweights
+    // large residuals further, so the realised correction stays softer than the
+    // raw variance ratio implies -- deliberately, since a false loop that
+    // survived the ICP fitness gate must not be able to fold the map.
     gtsam::Vector robustNoiseVector6(6); // gtsam::Pose3 factor has 6 elements (6D)
-    robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
+    robustNoiseVector6 << loopNoiseScoreRot, loopNoiseScoreRot, loopNoiseScoreRot,
+                          loopNoiseScoreTrans, loopNoiseScoreTrans, loopNoiseScoreTrans;
     robustLoopNoise = gtsam::noiseModel::Robust::Create(
                     gtsam::noiseModel::mEstimator::Cauchy::Create(1),
                     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6) );
@@ -1276,8 +1297,21 @@ int main(int argc, char **argv)
     historyKeyframeSearchTimeDiff = g_node->get_parameter("historyKeyframeSearchTimeDiff").as_double();
     g_node->declare_parameter<int>("historyKeyframeSearchNum", 25);
     historyKeyframeSearchNum = g_node->get_parameter("historyKeyframeSearchNum").as_int();
+    // loopNoiseScore is retained for backward compatibility: it is the fallback
+    // for whichever of the split pair is left <= 0. See initNoises() for why one
+    // scalar across all six DOF cannot be right when odomNoise splits them 100x.
     g_node->declare_parameter<double>("loopNoiseScore", 0.5);
     loopNoiseScore = g_node->get_parameter("loopNoiseScore").as_double();
+    g_node->declare_parameter<double>("loopNoiseScoreRot", -1.0);
+    loopNoiseScoreRot = g_node->get_parameter("loopNoiseScoreRot").as_double();
+    g_node->declare_parameter<double>("loopNoiseScoreTrans", -1.0);
+    loopNoiseScoreTrans = g_node->get_parameter("loopNoiseScoreTrans").as_double();
+    if (loopNoiseScoreRot <= 0.0)   loopNoiseScoreRot = loopNoiseScore;
+    if (loopNoiseScoreTrans <= 0.0) loopNoiseScoreTrans = loopNoiseScore;
+    RCLCPP_INFO(g_node->get_logger(),
+        "Loop factor noise: rotation %.2e rad^2, translation %.2e m^2 "
+        "(odometry chain is 1e-6 / 1e-4 per edge)",
+        loopNoiseScoreRot, loopNoiseScoreTrans);
     g_node->declare_parameter<int>("graphUpdateTimes", 2);
     graphUpdateTimes = g_node->get_parameter("graphUpdateTimes").as_int();
     g_node->declare_parameter<double>("loopFitnessScoreThreshold", 0.3);
