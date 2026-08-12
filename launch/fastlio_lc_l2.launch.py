@@ -264,12 +264,22 @@ def generate_launch_description():
 
             # Scan Context (indoor, Unitree L2: 30 m det_range -> same
             # indoor radius as the corridor benchmark run)
-            # NOTE these two are currently INERT: performSCLoopClosure() exists
-            # but is never called -- process_lcd() only runs the radius search.
-            # The descriptors are still computed for every keyframe, so the cost
-            # is paid and nothing reads the result.
             'sc_dist_thres': 0.4,
             'sc_max_radius': 20.0,
+            # Sensor height above the floor. Upstream hardcoded 2.0 (a car/
+            # handheld value) inside SCManager; Pepper carries the L2 at 0.2582 m
+            # per pepper_slam/config/sensor_tf.yaml. Wrong values here skew the
+            # height binning the descriptor is built from.
+            'sc_lidar_height': 0.2582,
+            # performSCLoopClosure() was dead code until 2026-08-12; descriptors
+            # were built for every keyframe and never read. Now callable, but
+            # OFF by default: Scan Context's known failure mode is self-similar
+            # geometry, and a repetitive indoor corridor is exactly that. Its
+            # value is covering what the radius search structurally cannot --
+            # a revisit once drift already exceeds historyKeyframeSearchRadius.
+            # Every candidate it proposes still faces the same ICP fitness test.
+            # Turn on if closures are being missed after long open-loop stretches.
+            'use_scan_context': False,
 
             # loop closure
             # 1.5 m is tight, but detection now runs on the OPTIMISED poses, so

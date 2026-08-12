@@ -133,7 +133,8 @@ noiseModel::Base::shared_ptr robustGPSNoise;
 
 pcl::VoxelGrid<PointType> downSizeFilterScancontext;
 SCManager scManager;
-double scDistThres, scMaximumRadius;
+double scDistThres, scMaximumRadius, scLidarHeight;
+bool useScanContext = false;
 
 pcl::VoxelGrid<PointType> downSizeFilterICP;
 std::mutex mtxICP;
@@ -783,19 +784,34 @@ void process_pg()
     }
 } // process_pg
 
+// Place-recognition loop detection, complementary to the radius search: it
+// matches on APPEARANCE, so it can still fire when drift already exceeds
+// historyKeyframeSearchRadius -- the case the radius search structurally
+// cannot cover. Gated on use_scan_context because Scan Context's known
+// weakness is self-similar geometry, and a repetitive indoor corridor is
+// exactly that; every candidate it proposes still has to pass the same ICP
+// fitness test, so a false proposal costs time rather than correctness.
 void performSCLoopClosure(void)
 {
-    if( int(keyframePoses.size()) < scManager.NUM_EXCLUDE_RECENT) // do not try too early
+    // LOCAL FIX: size/back() read without mKF while process_pg appends.
+    mKF.lock();
+    const int numKeyframes = int(keyframePoses.size());
+    mKF.unlock();
+    if( numKeyframes < scManager.NUM_EXCLUDE_RECENT) // do not try too early
         return;
 
     auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff
     int SCclosestHistoryFrameID = detectResult.first;
     if( SCclosestHistoryFrameID != -1 ) {
         const int prev_node_idx = SCclosestHistoryFrameID;
-        const int curr_node_idx = keyframePoses.size() - 1; // because cpp starts 0 and ends n-1
-        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
-
+        const int curr_node_idx = numKeyframes - 1; // because cpp starts 0 and ends n-1
         mBuf.lock();
+        // Skip if the radius search already has an accepted constraint here.
+        if (loopIndexContainer.find(curr_node_idx) != loopIndexContainer.end()) {
+            mBuf.unlock();
+            return;
+        }
+        cout << "[SC] Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << endl;
         scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
         // adding actual 6D constraints in the other thread, icp_calculation.
         mBuf.unlock();
@@ -958,6 +974,10 @@ void process_lcd(void)
     {
         rate.sleep();
         performRSLoopClosure();
+        // LOCAL FIX: performSCLoopClosure() existed but was never called, so
+        // makeAndSaveScancontextAndKeys() built a descriptor for every keyframe
+        // that nothing ever read, and sc_dist_thres / sc_max_radius were inert.
+        if (useScanContext) performSCLoopClosure();
         visualizeLoopClosure();
     }
 } // process_lcd
@@ -1239,6 +1259,15 @@ int main(int argc, char **argv)
     scDistThres = g_node->get_parameter("sc_dist_thres").as_double();
     g_node->declare_parameter<double>("sc_max_radius", 80.0);
     scMaximumRadius = g_node->get_parameter("sc_max_radius").as_double();
+    // Height of the sensor above the floor, in the frame the keyframe clouds
+    // arrive in. Upstream hardcoded 2.0 inside SCManager; on Pepper the L2 sits
+    // at 0.2582 m, so that shifted every point ~1.75 m up before binning.
+    g_node->declare_parameter<double>("sc_lidar_height", 2.0);
+    scLidarHeight = g_node->get_parameter("sc_lidar_height").as_double();
+    // Off by default: performSCLoopClosure() was dead code, so enabling it
+    // changes detection behaviour and should be an explicit opt-in.
+    g_node->declare_parameter<bool>("use_scan_context", false);
+    useScanContext = g_node->get_parameter("use_scan_context").as_bool();
 
     // for loop closure detection
     g_node->declare_parameter<double>("historyKeyframeSearchRadius", 10.0);
@@ -1279,6 +1308,11 @@ int main(int argc, char **argv)
 
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
+    scManager.setLidarHeight(scLidarHeight);
+    RCLCPP_INFO(g_node->get_logger(),
+        "Scan Context place recognition: %s (dist_thres %.2f, max_radius %.1f m, lidar_height %.3f m)",
+        useScanContext ? "ENABLED" : "disabled (descriptors still built)",
+        scDistThres, scMaximumRadius, scLidarHeight);
 
     // LOCAL FIX: this leaf size was hardcoded at 0.4 m, and it is applied to
     // every keyframe BEFORE the cloud is stored in keyframeLaserClouds (see

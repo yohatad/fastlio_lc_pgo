@@ -80,7 +80,14 @@ public:
 
 public:
     // hyper parameters ()
-    const double LIDAR_HEIGHT = 2.0; // lidar height : add this for simply directly using lidar scan in the lidar local coord (not robot base coord) / if you use robot-coord-transformed lidar scans, just set this as 0.
+    // Sensor height above the floor, added to every point's z before the polar
+    // grid is binned, so the descriptor is referenced to the ground rather than
+    // to the sensor. Upstream hardcodes 2.0 -- a car/handheld-rig value. Pepper
+    // carries the L2 at 0.2582 m (pepper_slam/config/sensor_tf.yaml,
+    // base_footprint -> l2lidar_frame), so 2.0 shifted every point ~1.75 m up
+    // and skewed the height binning the descriptor is built from. Now settable;
+    // see setLidarHeight(). Use 0 if you feed scans already in base coords.
+    double LIDAR_HEIGHT = 2.0;
 
     const int    PC_NUM_RING = 20; // 20 in the original paper (IROS 18)
     const int    PC_NUM_SECTOR = 60; // 60 in the original paper (IROS 18)
@@ -106,6 +113,7 @@ public:
     // setter
     void setSCdistThres(double _new_thres);
     void setMaximumRadius(double _max_r);
+    void setLidarHeight(double _h);
 
     // data 
     std::vector<double> polarcontexts_timestamp_; // optional.
