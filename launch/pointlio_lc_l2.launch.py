@@ -50,6 +50,16 @@ def generate_launch_description():
                     'separate from fastlio_lc_l2.launch.py\'s default so the two '
                     'backends cannot wipe each other\'s saved runs.'
     )
+    declare_lio_config_file_cmd = DeclareLaunchArgument(
+        'lio_config_file', default_value='l2lidar_rsimu.yaml',
+        description='Point-LIO config. l2lidar_rsimu.yaml uses the RealSense '
+                    'IMU (default); l2lidar_node.yaml uses the L2 s own -- see '
+                    'utils/L2_IMU/REPORT.md.')
+    declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
+        'lidar_imu_frame', default_value='camera_imu_optical_frame',
+        description='Static frame matching the config s publish.body_frame. '
+                    'camera_imu_optical_frame for l2lidar_rsimu.yaml, '
+                    'l2lidar_frame_imu for l2lidar_node.yaml.')
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='false',
         description='Launch RViz2 with both the raw Point-LIO view and the loop-closure '
@@ -155,6 +165,7 @@ def generate_launch_description():
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
             'bridge_level_frame': 'false',
+            'config_file': LaunchConfiguration('lio_config_file'),
         }.items()
     )
 
@@ -174,6 +185,13 @@ def generate_launch_description():
             'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
+            # MUST match the LIO config's publish.body_frame. level_source
+            # 'calibration' builds the map -> map_lidar levelling rotation from
+            # base_frame -> lidar_imu_frame; left at the node's
+            # l2lidar_frame_imu default while Point-LIO estimates the RealSense
+            # IMU, the whole map is levelled by the WRONG mount and comes out
+            # roughly 90 deg off, with no error logged anywhere.
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
         }],
     )
 
@@ -286,6 +304,8 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_save_directory_cmd)
+    ld.add_action(declare_lio_config_file_cmd)
+    ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)

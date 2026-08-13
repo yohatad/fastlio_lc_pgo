@@ -197,6 +197,14 @@ def generate_launch_description():
             'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
+            # MUST match the LIO config's publish.body_frame. level_source
+            # 'calibration' builds the map -> map_lidar levelling rotation from
+            # base_frame -> lidar_imu_frame, so leaving it at the node's
+            # l2lidar_frame_imu default while FAST-LIO estimates the RealSense
+            # IMU levels the whole map by the WRONG mount -- the two differ by
+            # the camera's optical rotation, so the cloud comes out pointing
+            # about 90 deg off with no error anywhere.
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
         }],
     )
 
