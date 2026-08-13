@@ -419,7 +419,7 @@ Visualization Manager:
     - Class: rviz_common/Group
       Displays:
         - Angle Tolerance: 0.10000000149011612
-          Class: rviz_default_plugins/odom_lio
+          Class: rviz_default_plugins/Odometry
           Covariance:
             Orientation:
               Alpha: 0.5
@@ -592,7 +592,7 @@ Visualization Manager:
     - Class: rviz_common/Group
       Displays:
         - Angle Tolerance: 0.10000000149011612
-          Class: rviz_default_plugins/odom_lio
+          Class: rviz_default_plugins/Odometry
           Covariance:
             Orientation:
               Alpha: 0.5
