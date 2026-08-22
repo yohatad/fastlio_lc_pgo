@@ -168,6 +168,15 @@ rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srvBatchOptimize;
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
+// Full path of the assembled map written by /pgo_batch_optimize. Kept SEPARATE
+// from save_directory on purpose: save_directory is scratch -- this node wipes
+// <save_directory>/Scans recursively at startup and fills it with one .pcd per
+// keyframe plus three pose/time logs -- whereas the finished map is a
+// deliverable that belongs beside the 2D grid it must share a frame with
+// (pepper_navigation/map). Pointing save_directory itself at the map directory
+// would dump ~1000 scratch files into it and wipe a Scans/ subfolder there.
+// Empty means "save_directory + map_batch.pcd", i.e. the historical behaviour.
+std::string map_pcd_path;
 // World frame all PGO outputs (map, path, odom, loop markers, TF parent) are
 // stamped in. Mirrors FAST-LIO's publish.map_frame parameter: defaults to the
 // legacy "camera_init" but is overridden to "odom" so the optimized map lands
@@ -1210,13 +1219,47 @@ void batchOptimizeHandler(
         }
     }
     batchMap->header.frame_id = saved_frame;
-    pcl::io::savePCDFileBinary(save_directory + "map_batch.pcd", *batchMap);
+
+    // Create the parent directory: map_pcd_path can point outside
+    // save_directory (which was created at startup), and savePCDFileBinary
+    // does NOT create it -- it would just throw after the whole expensive
+    // LM + rebuild had already succeeded.
+    const std::filesystem::path map_out(map_pcd_path);
+    if (map_out.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(map_out.parent_path(), ec);
+        if (ec) {
+            RCLCPP_ERROR(g_node->get_logger(),
+                "Could not create map output directory '%s': %s",
+                map_out.parent_path().c_str(), ec.message().c_str());
+            response->success = false;
+            response->message = "map output directory could not be created: "
+                                + map_out.parent_path().string();
+            return;
+        }
+    }
+    try {
+        // savePCDFileBinary throws on an unwritable path. Catch it so a bad
+        // map_pcd_path costs an error message, not the whole run -- the
+        // keyframes are still on disk and utils/build_pgo_map.py can rebuild.
+        pcl::io::savePCDFileBinary(map_pcd_path, *batchMap);
+    } catch (const std::exception &e) {
+        RCLCPP_ERROR(g_node->get_logger(),
+            "Failed to write map '%s': %s. The batch poses ARE saved; rebuild "
+            "the cloud offline with utils/build_pgo_map.py.",
+            map_pcd_path.c_str(), e.what());
+        response->success = false;
+        response->message = std::string("failed to write ") + map_pcd_path
+                            + ": " + e.what();
+        return;
+    }
 
     std::ostringstream msg;
     msg << "Batch LM re-optimization done over " << n << " keyframes. "
         << "Graph error " << initialError << " -> " << finalError << ". "
         << "Poses: " << save_directory << "optimized_poses_batch.txt, "
-        << "map: " << save_directory << "map_batch.pcd";
+        << "map: " << map_pcd_path << " (frame " << saved_frame << ", "
+        << batchMap->size() << " pts)";
     response->success = true;
     response->message = msg.str();
     RCLCPP_INFO(g_node->get_logger(), "%s", msg.str().c_str());
@@ -1275,6 +1318,18 @@ int main(int argc, char **argv)
     level_frame = g_node->get_parameter("level_frame").as_string();
     g_node->declare_parameter<bool>("save_in_level_frame", true);
     save_in_level_frame = g_node->get_parameter("save_in_level_frame").as_bool();
+    // Where the finished map goes. Defaults to the historical
+    // <save_directory>/map_batch.pcd so existing runs are unaffected; point it
+    // at pepper_navigation/map to write the deliverable straight into the map
+    // directory WITHOUT moving the scratch (Scans/, pose logs) there too.
+    g_node->declare_parameter<std::string>("map_pcd_path", "");
+    map_pcd_path = g_node->get_parameter("map_pcd_path").as_string();
+    if (map_pcd_path.empty()) {
+        map_pcd_path = save_directory + "map_batch.pcd";
+    }
+    RCLCPP_INFO(g_node->get_logger(),
+        "/pgo_batch_optimize will write the map to: %s", map_pcd_path.c_str());
+
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgScansDirectory = save_directory + "Scans/";

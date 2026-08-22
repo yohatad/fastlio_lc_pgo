@@ -27,6 +27,32 @@ def generate_launch_description():
         'save_directory', default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/',
         description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
     )
+
+    # The finished 3D map goes NEXT TO THE 2D GRID it shares a frame with, in
+    # pepper_navigation/map -- not into save_directory, which is scratch (this
+    # node wipes <save_directory>/Scans at startup and fills it with one .pcd
+    # per keyframe plus pose logs). Written to the SOURCE tree so it survives a
+    # rebuild; pepper_navigation's CMakeLists installs map/*.pcd to its share.
+    declare_map_pcd_path_cmd = DeclareLaunchArgument(
+        'map_pcd_path',
+        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/map/pepper_map_lc.pcd',
+        description='Full path of the map written by /pgo_batch_optimize. Empty '
+                    'falls back to <save_directory>/map_batch.pcd.'
+    )
+
+    # MUST be declared here, not only in the bag wrapper: ROS 2 launch silently
+    # DROPS launch_arguments an included description does not declare. The
+    # wrapper passed keyframe_filter_size:=0.25 for months and pgo_node kept its
+    # own 0.4 default (verified with `ros2 param get /laserPGO
+    # keyframe_filter_size`), so every map was coarser than intended. This leaf
+    # is applied BEFORE a keyframe is stored, so map_save_filter_size can never
+    # recover the resolution it discarded.
+    declare_keyframe_filter_size_cmd = DeclareLaunchArgument(
+        'keyframe_filter_size', default_value='0.25',
+        description='Voxel leaf (m) applied to each keyframe BEFORE storage, so '
+                    'it bounds the density of every downstream product. 0.25 '
+                    "matches FAST-LIO's own filter_size_surf, the real floor."
+    )
     # 2026-08-12: was hardcoded to l2.yaml, i.e. the L2's own IMU. That gyro
     # cancels rotation about the gravity axis below ~16 deg/s and cost 139 deg
     # of heading over a 744 s run (utils/L2_IMU/REPORT.md), so loop closure was
@@ -291,6 +317,18 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
+            'map_pcd_path': LaunchConfiguration('map_pcd_path'),
+            # MUST match pgo_map_odom_bridge's level_frame below ('map').
+            # pgo_node's own default is 'map_level', and when the two disagree
+            # its canTransform(level_frame, map_frame) fails, so it WARNS and
+            # silently saves the .pcd in the RAW map_lidar frame instead --
+            # ~90 deg off gravity (measured -92.2 deg roll / -88.1 deg yaw on
+            # 2026-08-22), which does not match the 2D grid octomap builds in
+            # 'map'. The service still returns success=True, so the only clue
+            # is the "frame map_lidar" in its message. Recover a map already
+            # saved that way with utils/build_pgo_map.py --level-tf.
+            'level_frame': 'map',
+            'keyframe_filter_size': LaunchConfiguration('keyframe_filter_size'),
             'cloud_topic': '/cloud_registered_body',
             'odom_topic': '/odom_lio',
 
@@ -394,6 +432,8 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_save_directory_cmd)
+    ld.add_action(declare_map_pcd_path_cmd)
+    ld.add_action(declare_keyframe_filter_size_cmd)
     ld.add_action(declare_lio_config_file_cmd)
     ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_sensor_tf_scope_cmd)
