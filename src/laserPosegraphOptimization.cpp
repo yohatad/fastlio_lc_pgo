@@ -1161,10 +1161,37 @@ void batchOptimizeHandler(
     // is available as soon as that bridge has leveled.
     std::string saved_frame = map_frame;
     if (save_in_level_frame) {
+        // NO TIMEOUT. This used to pass tf2::durationFromSec(2.0), which HUNG
+        // THE SERVICE FOREVER and cost a full mapping run:
+        //
+        //   * canTransform's timeout is counted in ROS TIME. Under
+        //     use_sim_time the clock comes from the bag, and by the time anyone
+        //     calls /pgo_batch_optimize the bag has FINISHED -- so /clock has
+        //     stopped, ROS time is frozen, and a deadline of "now + 2 s" is
+        //     never reached. The wait loop nanosleeps forever; the node sits at
+        //     0% CPU looking deadlocked. The catch below cannot help, because
+        //     it only runs if the timeout actually fires.
+        //   * Separately, waiting on TF with a timeout from inside a callback
+        //     on a SingleThreadedExecutor (which is what main() spins) is a
+        //     deadlock pattern in its own right: the executor that would
+        //     deliver /tf is the one being blocked.
+        //
+        // Waiting was never needed anyway. level_frame <- map_frame is STATIC,
+        // published once by the *_map_odom_bridge early in the run, so it is
+        // already in the buffer -- or it never will be, in which case failing
+        // immediately into the fallback below is exactly right.
+        std::string tf_err;
+        if (!g_tf_buffer->canTransform(level_frame, map_frame,
+                                       tf2::TimePointZero, &tf_err)) {
+            RCLCPP_WARN(g_node->get_logger(),
+                "No %s <- %s yet (%s). Saving in the RAW %s frame; see the note "
+                "below on what that costs.",
+                level_frame.c_str(), map_frame.c_str(), tf_err.c_str(),
+                map_frame.c_str());
+        }
         try {
             auto tf = g_tf_buffer->lookupTransform(
-                level_frame, map_frame, tf2::TimePointZero,
-                tf2::durationFromSec(2.0));
+                level_frame, map_frame, tf2::TimePointZero);
             pcl::PointCloud<PointType>::Ptr leveled(new pcl::PointCloud<PointType>());
             pcl_ros::transformPointCloud(*batchMap, *leveled, tf);
             batchMap = leveled;
