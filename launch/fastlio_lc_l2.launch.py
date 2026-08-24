@@ -198,11 +198,9 @@ def generate_launch_description():
         ),
         launch_arguments={
             'config_file': LaunchConfiguration('lio_config_file'),
-            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
-            'bridge_level_frame': 'false',
         }.items()
     )
 
@@ -230,7 +228,6 @@ def generate_launch_description():
             # IMU levels the whole map by the WRONG mount -- the two differ by
             # the camera's optical rotation, so the cloud comes out pointing
             # about 90 deg off with no error anywhere.
-            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
         }],
     )
 
@@ -429,6 +426,20 @@ def generate_launch_description():
             'map_save_filter_size': map_save_filter_size,
         }],
     )
+    # odom -> base_footprint. FAST_LIO's mapping.launch.py no longer starts this
+    # (see FAST_LIO d8b274c): it is Pepper glue, and lived in a launch file
+    # shared with every other FAST-LIO sensor config.
+    lio_bridge_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('pepper_slam'),
+                         'launch', 'lio_odom_bridge.launch.py')),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'config_file': LaunchConfiguration('lio_config_file'),
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
+            'bridge_level_frame': 'false',
+        }.items())
+
 
     ld = LaunchDescription()
     ld.add_action(declare_save_directory_cmd)
@@ -449,6 +460,7 @@ def generate_launch_description():
     ld.add_action(declare_mapviz_filter_size_cmd)
     ld.add_action(declare_map_save_filter_size_cmd)
     ld.add_action(sensor_tf_launch)
+    ld.add_action(lio_bridge_launch)
     ld.add_action(fast_lio_launch)
     ld.add_action(pgo_node)
     ld.add_action(pgo_map_odom_bridge)
