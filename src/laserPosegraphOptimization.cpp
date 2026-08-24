@@ -70,6 +70,7 @@
 #include <gtsam/geometry/Rot2.h>
 #include <gtsam/geometry/Pose2.h>
 #include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/PoseTranslationPrior.h>
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -128,6 +129,24 @@ gtsam::Values isamCurrentEstimate;
 
 noiseModel::Diagonal::shared_ptr priorNoise;
 noiseModel::Diagonal::shared_ptr odomNoise;
+
+// Planar-motion prior. Down a corridor the two long walls leave the scan
+// matcher with no vertical constraint, so height drifts without bound -- one
+// 11 min run came out with an 80 m z band. The robot drives on a flat floor,
+// so pin every keyframe to the height of the first one.
+//
+// The pose graph lives in the raw LIO world frame, which is the IMU mount
+// orientation at t=0 and is NOT gravity-aligned. "Height" is therefore the
+// component along planar_gravity, not along z -- for the RealSense IMU gravity
+// falls along +Y. Only that one axis is constrained: planarNoise is a rotated
+// covariance, tight along planar_gravity and free in the plane normal to it,
+// so x/y (and all of rotation) stay exactly as unconstrained as before.
+bool planar_prior_enable = false;
+Eigen::Vector3d planar_gravity(0.0, 1.0, 0.0);
+double planar_sigma_h = 0.05;      // [m] how flat the floor actually is
+double planar_sigma_free = 1e4;    // [m] the two in-plane axes, left free
+noiseModel::Gaussian::shared_ptr planarNoise;
+double planar_h0 = 0.0;            // height of node 0 along planar_gravity
 noiseModel::Base::shared_ptr robustLoopNoise;
 noiseModel::Base::shared_ptr robustGPSNoise;
 
@@ -760,6 +779,8 @@ void process_pg()
             if( ! gtSAMgraphMade /* prior node */) {
                 const int init_node_idx = 0;
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
+                // Reference height every later planar prior is measured against.
+                planar_h0 = planar_gravity.normalized().dot(poseOrigin.translation());
 
                 mtxPosegraph.lock();
                 {
@@ -780,6 +801,18 @@ void process_pg()
                 {
                     // odom factor
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
+
+                    // planar-motion factor: hold this node at node 0's height.
+                    // The measurement is poseTo slid along gravity back onto
+                    // node 0's floor plane, so the in-plane residual is zero
+                    // and only the height error is left for planarNoise to
+                    // weigh -- which it does on that axis alone.
+                    if (planar_prior_enable) {
+                        const Eigen::Vector3d g = planar_gravity.normalized();
+                        const Eigen::Vector3d t = poseTo.translation();
+                        const gtsam::Point3 onFloor = t - (g.dot(t) - planar_h0) * g;
+                        gtSAMgraph.add(gtsam::PoseTranslationPrior<gtsam::Pose3>(curr_node_idx, onFloor, planarNoise));
+                    }
 
                     // gps factor
                     if(hasGPSforThisKF) {
@@ -1318,6 +1351,46 @@ int main(int argc, char **argv)
     level_frame = g_node->get_parameter("level_frame").as_string();
     g_node->declare_parameter<bool>("save_in_level_frame", true);
     save_in_level_frame = g_node->get_parameter("save_in_level_frame").as_bool();
+
+    g_node->declare_parameter<bool>("planar_prior_enable", false);
+    planar_prior_enable = g_node->get_parameter("planar_prior_enable").as_bool();
+    g_node->declare_parameter<std::vector<double>>("planar_gravity", {0.0, 1.0, 0.0});
+    {
+        const auto g = g_node->get_parameter("planar_gravity").as_double_array();
+        if (g.size() == 3 && Eigen::Vector3d(g[0], g[1], g[2]).norm() > 1e-6)
+            planar_gravity = Eigen::Vector3d(g[0], g[1], g[2]);
+        else if (planar_prior_enable)
+            RCLCPP_WARN(g_node->get_logger(),
+                        "planar_gravity must be 3 non-zero elements; keeping default +Y");
+    }
+    g_node->declare_parameter<double>("planar_sigma_h", 0.05);
+    planar_sigma_h = g_node->get_parameter("planar_sigma_h").as_double();
+    g_node->declare_parameter<double>("planar_sigma_free", 1e4);
+    planar_sigma_free = g_node->get_parameter("planar_sigma_free").as_double();
+
+    // Covariance for the planar prior, built in a basis whose third axis is
+    // gravity: loose, loose, tight. Rotating it back into the graph frame
+    // gives an ellipsoid that is a thin disc perpendicular to gravity, which
+    // is exactly "you may move anywhere on the floor, but not off it".
+    {
+        const Eigen::Vector3d gz = planar_gravity.normalized();
+        const Eigen::Vector3d seed = (std::abs(gz.x()) < 0.9) ? Eigen::Vector3d::UnitX()
+                                                              : Eigen::Vector3d::UnitY();
+        const Eigen::Vector3d gx = (seed - seed.dot(gz) * gz).normalized();
+        Eigen::Matrix3d R;
+        R.col(0) = gx;
+        R.col(1) = gz.cross(gx);
+        R.col(2) = gz;
+        const Eigen::Matrix3d D = Eigen::Vector3d(planar_sigma_free * planar_sigma_free,
+                                                  planar_sigma_free * planar_sigma_free,
+                                                  planar_sigma_h * planar_sigma_h).asDiagonal();
+        planarNoise = noiseModel::Gaussian::Covariance(R * D * R.transpose());
+    }
+    if (planar_prior_enable)
+        RCLCPP_INFO(g_node->get_logger(),
+                    "planar prior ON: gravity [%.3f %.3f %.3f], sigma_h %.3f m",
+                    planar_gravity.normalized().x(), planar_gravity.normalized().y(),
+                    planar_gravity.normalized().z(), planar_sigma_h);
     // Where the finished map goes. Defaults to the historical
     // <save_directory>/map_batch.pcd so existing runs are unaffected; point it
     // at pepper_navigation/map to write the deliverable straight into the map

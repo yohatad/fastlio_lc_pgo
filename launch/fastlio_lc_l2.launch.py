@@ -1,4 +1,5 @@
 import os
+from typing import List
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -9,6 +10,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -59,6 +61,26 @@ def generate_launch_description():
     # being asked to repair odometry with a known, large, systematic yaw error.
     # l2_rsimu.yaml drives the same estimator from the RealSense IMU instead;
     # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst.
+    # Down a corridor the two long walls give the scan matcher nothing to fix
+    # height against, so z drifts without bound and loop closure cannot pull it
+    # back (measured on slam_20260823_merged: an 80.3 m z band, and a full batch
+    # re-optimization over 2736 keyframes moved the graph error only 1.2%).
+    # This pins every keyframe to the first one's height and nothing else.
+    declare_planar_prior_cmd = DeclareLaunchArgument(
+        'planar_prior', default_value='true',
+        description='Constrain keyframe height to the floor plane. Turn off '
+                    'only if the robot actually changes level (ramp, lift).')
+    # Gravity in the pose graph's own frame, which is the IMU mount orientation
+    # at t=0 -- NOT gravity-aligned. For the RealSense IMU gravity reads along
+    # +Y, so this is emphatically not [0, 0, 1]. Re-measure if the IMU moves.
+    declare_planar_gravity_cmd = DeclareLaunchArgument(
+        'planar_gravity', default_value='[-0.0075, 1.0, 0.0031]',
+        description='Unit gravity in the LIO world frame.')
+    declare_planar_sigma_cmd = DeclareLaunchArgument(
+        'planar_sigma_h', default_value='0.05',
+        description='Std dev [m] of how far off the floor plane a keyframe may '
+                    'sit. Loosen if the floor is genuinely uneven.')
+
     declare_lio_config_file_cmd = DeclareLaunchArgument(
         'lio_config_file', default_value='l2_rsimu.yaml',
         description='FAST-LIO config. l2_rsimu.yaml uses the RealSense IMU '
@@ -335,6 +357,15 @@ def generate_launch_description():
             # FAST-LIO's odom into the REP-105 map -> odom transform.
             'map_frame': 'pgo_init',
 
+            # planar-motion prior -- see declare_planar_prior_cmd above
+            'planar_prior_enable': ParameterValue(
+                LaunchConfiguration('planar_prior'), value_type=bool),
+            'planar_gravity': ParameterValue(
+                LaunchConfiguration('planar_gravity'),
+                value_type=List[float]),
+            'planar_sigma_h': ParameterValue(
+                LaunchConfiguration('planar_sigma_h'), value_type=float),
+
             # keyframe selection
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
@@ -446,6 +477,9 @@ def generate_launch_description():
     ld.add_action(declare_save_directory_cmd)
     ld.add_action(declare_map_pcd_path_cmd)
     ld.add_action(declare_keyframe_filter_size_cmd)
+    ld.add_action(declare_planar_prior_cmd)
+    ld.add_action(declare_planar_gravity_cmd)
+    ld.add_action(declare_planar_sigma_cmd)
     ld.add_action(declare_lio_config_file_cmd)
     ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_rviz_cmd)
