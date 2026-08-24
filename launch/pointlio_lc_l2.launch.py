@@ -16,7 +16,8 @@
 # Usage:
 #   ros2 launch fastlio_lc_pgo pointlio_lc_l2.launch.py
 #   ros2 bag play <bag> --clock --topics /points /imu/data /tf_static
-#   (do NOT replay /tf -- see pepper_sensor_tf.launch.py's header)
+#   (replaying /tf is SAFE and wanted -- see pepper_sensor_tf.launch.py's
+#    header for why the old "do not replay /tf" advice no longer holds.)
 
 import os
 
@@ -97,9 +98,16 @@ def generate_launch_description():
         description='RViz config file path (shared with fastlio_lc_l2.launch.py -- '
                     'the PGO topics it visualizes are the same regardless of backend).'
     )
+    # false, NOT true: this is the LIVE entry point. Every wrapper in
+    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
+    # default only ever applies on the robot -- where 'true' pins sim time at 0,
+    # so tf never resolves and nothing fuses, silently and with no error.
+    # It also feeds the sensor_tf scope derivation: false -> 'mount', correct
+    # live because the RealSense driver publishes its own camera edges (adding a
+    # second copy is the nondeterministic-latch problem sensor_tf.yaml warns of).
     declare_use_sim_time_cmd = DeclareLaunchArgument(
-        'use_sim_time', default_value='true',
-        description='Use the bag clock (ros2 bag play --clock). Keep true for offline runs.'
+        'use_sim_time', default_value='false',
+        description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.'
     )
     declare_occupancy_cmd = DeclareLaunchArgument(
         'occupancy', default_value='true',
@@ -176,11 +184,11 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # Point-LIO owns odom_lidar -> base_footprint (via lio_map_odom_bridge,
+    # Point-LIO owns lio_init -> base_footprint (via lio_map_odom_bridge,
     # same as FAST-LIO's variant). bridge_level_frame:='false' for the same
-    # reason: PGO owns map_lidar -> odom_lidar below, so odom_lidar must keep a
+    # reason: PGO owns pgo_init -> lio_init below, so lio_init must keep a
     # single parent. The leveling happens one level up instead --
-    # pgo_map_odom_bridge publishes map -> map_lidar -- so the leveled frame in
+    # pgo_map_odom_bridge publishes map -> pgo_init -- so the leveled frame in
     # this stack is 'map', not 'odom'.
     point_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -198,21 +206,21 @@ def generate_launch_description():
     # PGO owns the loop-closure correction map -> odom, same as the FAST-LIO
     # variant -- odom_topic is the only thing that changes for Point-LIO.
     pgo_map_odom_bridge = Node(
-        package='fast_lio',
+        package='pepper_slam',
         executable='pgo_map_odom_bridge.py',
         name='pgo_map_odom_bridge',
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-            'map_frame': 'map_lidar',
-            'odom_frame': 'odom_lidar',
+            'map_frame': 'pgo_init',
+            'odom_frame': 'lio_init',
             'base_frame': 'base_footprint',
             'level_frame': 'map',
             'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
             # MUST match the LIO config's publish.body_frame. level_source
-            # 'calibration' builds the map -> map_lidar levelling rotation from
+            # 'calibration' builds the map -> pgo_init levelling rotation from
             # base_frame -> lidar_imu_frame; left at the node's
             # l2lidar_frame_imu default while Point-LIO estimates the RealSense
             # IMU, the whole map is levelled by the WRONG mount and comes out
@@ -228,7 +236,7 @@ def generate_launch_description():
     # set to l2lidar_frame_imu in point_lio/config/l2lidar_node.yaml (mirroring
     # FAST_LIO/config/l2.yaml). Nothing needed here.
     range_filter_node = Node(
-        package='fast_lio',
+        package='pepper_slam',
         executable='cloud_range_filter.py',
         name='cloud_range_filter',
         output='screen',
@@ -285,17 +293,17 @@ def generate_launch_description():
             # MUST match pgo_map_odom_bridge's level_frame below ('map').
             # pgo_node's own default is 'map_level', and when the two disagree
             # its canTransform(level_frame, map_frame) fails, so it WARNS and
-            # silently saves the .pcd in the RAW map_lidar frame instead --
+            # silently saves the .pcd in the RAW pgo_init frame instead --
             # ~90 deg off gravity (measured -92.2 deg roll / -88.1 deg yaw on
             # 2026-08-22), which does not match the 2D grid octomap builds in
             # 'map'. The service still returns success=True, so the only clue
-            # is the "frame map_lidar" in its message. Recover a map already
+            # is the "frame pgo_init" in its message. Recover a map already
             # saved that way with utils/build_pgo_map.py --level-tf.
             'level_frame': 'map',
             'keyframe_filter_size': LaunchConfiguration('keyframe_filter_size'),
             'cloud_topic': '/cloud_registered_body',  # Point-LIO's name matches FAST-LIO's
             'odom_topic': '/odom_lio',       # only this differs from the FAST-LIO variant
-            'map_frame': 'map_lidar',
+            'map_frame': 'pgo_init',
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
             # LOOP-CLOSURE ACCEPTANCE GATES, tightened 2026-08-10 after a run on

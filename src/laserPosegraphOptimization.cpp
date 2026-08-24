@@ -405,7 +405,7 @@ void pubPath( void )
     // quaternion -- and stamp 0, followed by a TF carrying the same. Downstream
     // pgo_map_odom_bridge.py does not validate it: pose_to_matrix falls back to
     // identity rotation on the degenerate quaternion and latches a bogus
-    // map_lidar -> odom_lidar correction until the next PGO update.
+    // pgo_init -> lio_init correction until the next PGO update.
     if (recentIdxUpdated <= 0)
         return;
 
