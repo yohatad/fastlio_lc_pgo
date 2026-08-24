@@ -70,12 +70,22 @@ def generate_launch_description():
         'planar_prior', default_value='true',
         description='Constrain keyframe height to the floor plane. Turn off '
                     'only if the robot actually changes level (ramp, lift).')
-    # Gravity in the pose graph's own frame, which is the IMU mount orientation
-    # at t=0 -- NOT gravity-aligned. For the RealSense IMU gravity reads along
-    # +Y, so this is emphatically not [0, 0, 1]. Re-measure if the IMU moves.
+    # Which axis the prior holds. Derived at runtime from the same map <-
+    # pgo_init transform the saved cloud is leveled by, so the two cannot
+    # disagree. The hardcoded value below was 2.43 deg off that axis, and over
+    # an 85 m corridor that leaked 3.0 m of height back into a trajectory whose
+    # own constrained axis was pinned to 0.14 m.
+    declare_planar_gravity_auto_cmd = DeclareLaunchArgument(
+        'planar_gravity_auto', default_value='true',
+        description='Derive the prior axis from the leveling TF. Set false only '
+                    'to pin it by hand via planar_gravity.')
+    # Fallback only, used when planar_gravity_auto is false. In the pose graph's
+    # own frame -- the IMU mount orientation at t=0, NOT gravity-aligned -- so
+    # for the RealSense IMU this reads along +Y, emphatically not [0, 0, 1].
     declare_planar_gravity_cmd = DeclareLaunchArgument(
         'planar_gravity', default_value='[-0.0075, 1.0, 0.0031]',
-        description='Unit gravity in the LIO world frame.')
+        description='Unit gravity in the LIO world frame; ignored unless '
+                    'planar_gravity_auto is false.')
     declare_planar_sigma_cmd = DeclareLaunchArgument(
         'planar_sigma_h', default_value='0.05',
         description='Std dev [m] of how far off the floor plane a keyframe may '
@@ -360,6 +370,8 @@ def generate_launch_description():
             # planar-motion prior -- see declare_planar_prior_cmd above
             'planar_prior_enable': ParameterValue(
                 LaunchConfiguration('planar_prior'), value_type=bool),
+            'planar_gravity_auto': ParameterValue(
+                LaunchConfiguration('planar_gravity_auto'), value_type=bool),
             'planar_gravity': ParameterValue(
                 LaunchConfiguration('planar_gravity'),
                 value_type=List[float]),
@@ -478,6 +490,7 @@ def generate_launch_description():
     ld.add_action(declare_map_pcd_path_cmd)
     ld.add_action(declare_keyframe_filter_size_cmd)
     ld.add_action(declare_planar_prior_cmd)
+    ld.add_action(declare_planar_gravity_auto_cmd)
     ld.add_action(declare_planar_gravity_cmd)
     ld.add_action(declare_planar_sigma_cmd)
     ld.add_action(declare_lio_config_file_cmd)

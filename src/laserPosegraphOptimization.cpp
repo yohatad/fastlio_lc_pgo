@@ -142,6 +142,10 @@ noiseModel::Diagonal::shared_ptr odomNoise;
 // covariance, tight along planar_gravity and free in the plane normal to it,
 // so x/y (and all of rotation) stay exactly as unconstrained as before.
 bool planar_prior_enable = false;
+// Derive the constrained axis from TF rather than trusting the number below.
+bool planar_gravity_auto = true;
+bool planar_resolved = false;
+Eigen::Vector3d planar_origin_t(0.0, 0.0, 0.0);  // node 0's translation
 Eigen::Vector3d planar_gravity(0.0, 1.0, 0.0);
 double planar_sigma_h = 0.05;      // [m] how flat the floor actually is
 double planar_sigma_free = 1e4;    // [m] the two in-plane axes, left free
@@ -230,6 +234,70 @@ std::shared_ptr<tf2_ros::TransformListener> g_tf_listener;
 std::string level_frame;
 bool save_in_level_frame = true;
 std::atomic<uint32_t> g_seq_counter{0};
+
+// Covariance for the planar prior, in a basis whose third axis is gravity:
+// loose, loose, tight. Rotated back into the graph frame it is a thin disc
+// perpendicular to gravity -- "move anywhere on the floor, but not off it".
+static void buildPlanarNoise()
+{
+    const Eigen::Vector3d gz = planar_gravity.normalized();
+    const Eigen::Vector3d seed = (std::abs(gz.x()) < 0.9) ? Eigen::Vector3d::UnitX()
+                                                          : Eigen::Vector3d::UnitY();
+    const Eigen::Vector3d gx = (seed - seed.dot(gz) * gz).normalized();
+    Eigen::Matrix3d R;
+    R.col(0) = gx;
+    R.col(1) = gz.cross(gx);
+    R.col(2) = gz;
+    const Eigen::Matrix3d D = Eigen::Vector3d(planar_sigma_free * planar_sigma_free,
+                                              planar_sigma_free * planar_sigma_free,
+                                              planar_sigma_h * planar_sigma_h).asDiagonal();
+    planarNoise = noiseModel::Gaussian::Covariance(R * D * R.transpose());
+    planar_h0 = gz.dot(planar_origin_t);
+}
+
+// Take the constrained axis off the SAME transform the saved map is leveled by,
+// so the prior and the map can never disagree about which way is up.
+//
+// This used to be a hardcoded gravity_init measurement, which sat 2.43 deg off
+// the leveling axis. The prior then held its own axis beautifully -- 0.14 m over
+// the whole run -- while the true height still spread 3.01 m, because across an
+// 85 m corridor a 2.43 deg error leaks 85*sin(2.43) = 3.6 m straight back in.
+// Deriving it also removes the stale-on-remount hazard: this is exactly the
+// class of bug that let the bridge level by the wrong IMU in the first place.
+//
+// Returns false while the TF is not published yet; the caller then skips the
+// prior for that keyframe and retries on the next one.
+static bool resolvePlanarGravity()
+{
+    if (planar_resolved) return true;
+    if (!planar_gravity_auto) {          // explicit override: trust the parameter
+        buildPlanarNoise();
+        planar_resolved = true;
+        return true;
+    }
+    geometry_msgs::msg::TransformStamped tf;
+    try {
+        tf = g_tf_buffer->lookupTransform(level_frame, map_frame, tf2::TimePointZero);
+    } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(g_node->get_logger(), *g_node->get_clock(), 5000,
+            "Planar prior waiting on %s <- %s to learn which way is up (%s).",
+            level_frame.c_str(), map_frame.c_str(), ex.what());
+        return false;
+    }
+    const tf2::Quaternion q(tf.transform.rotation.x, tf.transform.rotation.y,
+                            tf.transform.rotation.z, tf.transform.rotation.w);
+    // p_level = R * p_map, so level z is row 2 dotted with p_map: that row IS
+    // "up" expressed in graph coordinates.
+    const tf2::Vector3 up = tf2::Matrix3x3(q).getRow(2);
+    planar_gravity = Eigen::Vector3d(up.x(), up.y(), up.z()).normalized();
+    buildPlanarNoise();
+    planar_resolved = true;
+    RCLCPP_INFO(g_node->get_logger(),
+        "Planar prior axis from %s <- %s: [%+.4f %+.4f %+.4f], sigma_h %.3f m.",
+        level_frame.c_str(), map_frame.c_str(),
+        planar_gravity.x(), planar_gravity.y(), planar_gravity.z(), planar_sigma_h);
+    return true;
+}
 
 // -- small ROS1 -> ROS2 time helpers --------------------------------------
 inline double stampToSec(const builtin_interfaces::msg::Time & t)
@@ -779,8 +847,9 @@ void process_pg()
             if( ! gtSAMgraphMade /* prior node */) {
                 const int init_node_idx = 0;
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
-                // Reference height every later planar prior is measured against.
-                planar_h0 = planar_gravity.normalized().dot(poseOrigin.translation());
+                // Reference every later planar prior is measured against. The
+                // height itself is computed once the axis is known.
+                planar_origin_t = poseOrigin.translation();
 
                 mtxPosegraph.lock();
                 {
@@ -807,7 +876,7 @@ void process_pg()
                     // node 0's floor plane, so the in-plane residual is zero
                     // and only the height error is left for planarNoise to
                     // weigh -- which it does on that axis alone.
-                    if (planar_prior_enable) {
+                    if (planar_prior_enable && resolvePlanarGravity()) {
                         const Eigen::Vector3d g = planar_gravity.normalized();
                         const Eigen::Vector3d t = poseTo.translation();
                         const gtsam::Point3 onFloor = t - (g.dot(t) - planar_h0) * g;
@@ -1367,28 +1436,19 @@ int main(int argc, char **argv)
     planar_sigma_h = g_node->get_parameter("planar_sigma_h").as_double();
     g_node->declare_parameter<double>("planar_sigma_free", 1e4);
     planar_sigma_free = g_node->get_parameter("planar_sigma_free").as_double();
+    g_node->declare_parameter<bool>("planar_gravity_auto", true);
+    planar_gravity_auto = g_node->get_parameter("planar_gravity_auto").as_bool();
 
-    // Covariance for the planar prior, built in a basis whose third axis is
-    // gravity: loose, loose, tight. Rotating it back into the graph frame
-    // gives an ellipsoid that is a thin disc perpendicular to gravity, which
-    // is exactly "you may move anywhere on the floor, but not off it".
-    {
-        const Eigen::Vector3d gz = planar_gravity.normalized();
-        const Eigen::Vector3d seed = (std::abs(gz.x()) < 0.9) ? Eigen::Vector3d::UnitX()
-                                                              : Eigen::Vector3d::UnitY();
-        const Eigen::Vector3d gx = (seed - seed.dot(gz) * gz).normalized();
-        Eigen::Matrix3d R;
-        R.col(0) = gx;
-        R.col(1) = gz.cross(gx);
-        R.col(2) = gz;
-        const Eigen::Matrix3d D = Eigen::Vector3d(planar_sigma_free * planar_sigma_free,
-                                                  planar_sigma_free * planar_sigma_free,
-                                                  planar_sigma_h * planar_sigma_h).asDiagonal();
-        planarNoise = noiseModel::Gaussian::Covariance(R * D * R.transpose());
-    }
-    if (planar_prior_enable)
+    buildPlanarNoise();   // rebuilt once the axis is resolved from TF
+    if (planar_prior_enable && planar_gravity_auto)
         RCLCPP_INFO(g_node->get_logger(),
-                    "planar prior ON: gravity [%.3f %.3f %.3f], sigma_h %.3f m",
+                    "planar prior ON: axis to be derived from %s <- %s, "
+                    "sigma_h %.3f m", level_frame.c_str(), map_frame.c_str(),
+                    planar_sigma_h);
+    else if (planar_prior_enable)
+        RCLCPP_INFO(g_node->get_logger(),
+                    "planar prior ON: axis pinned by parameter to "
+                    "[%.4f %.4f %.4f], sigma_h %.3f m",
                     planar_gravity.normalized().x(), planar_gravity.normalized().y(),
                     planar_gravity.normalized().z(), planar_sigma_h);
     // Where the finished map goes. Defaults to the historical
