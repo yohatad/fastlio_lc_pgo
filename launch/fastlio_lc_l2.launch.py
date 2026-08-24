@@ -221,6 +221,7 @@ def generate_launch_description():
             'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             # MUST match the LIO config's publish.body_frame. level_source
             # 'calibration' builds the map -> pgo_init levelling rotation from
             # base_frame -> lidar_imu_frame, so leaving it at the node's
