@@ -20,6 +20,7 @@
 #    header for why the old "do not replay /tf" advice no longer holds.)
 
 import os
+from typing import List
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -30,6 +31,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -77,6 +79,32 @@ def generate_launch_description():
                     'it bounds the density of every downstream product. 0.25 '
                     "matches FAST-LIO's own filter_size_surf, the real floor."
     )
+    # Down a corridor the two long walls give the scan matcher no vertical
+    # constraint, so keyframe height drifts and loop closure cannot pull it
+    # back. Pins every keyframe to the first one's height and nothing else.
+    # Measured on slam_20260823_merged (FAST-LIO, same rig): trajectory
+    # vertical spread 5.14 m -> 0.09 m, horizontal extent unchanged.
+    declare_planar_prior_cmd = DeclareLaunchArgument(
+        'planar_prior', default_value='true',
+        description='Constrain keyframe height to the floor plane. Turn off '
+                    'only if the robot actually changes level (ramp, lift).')
+    # Derived at runtime from the same map <- pgo_init transform the saved
+    # cloud is leveled by, so the prior cannot hold a different "up" than the
+    # map does. That also makes this correct for Point-LIO without re-measuring
+    # anything: its world frame is its own, and the TF describes it.
+    declare_planar_gravity_auto_cmd = DeclareLaunchArgument(
+        'planar_gravity_auto', default_value='true',
+        description='Derive the prior axis from the leveling TF. Set false only '
+                    'to pin it by hand via planar_gravity.')
+    declare_planar_gravity_cmd = DeclareLaunchArgument(
+        'planar_gravity', default_value='[-0.0075, 1.0, 0.0031]',
+        description='Unit gravity in the LIO world frame; ignored unless '
+                    'planar_gravity_auto is false.')
+    declare_planar_sigma_cmd = DeclareLaunchArgument(
+        'planar_sigma_h', default_value='0.05',
+        description='Std dev [m] of how far off the floor plane a keyframe may '
+                    'sit. Loosen if the floor is genuinely uneven.')
+
     declare_lio_config_file_cmd = DeclareLaunchArgument(
         'lio_config_file', default_value='l2lidar_rsimu.yaml',
         description='Point-LIO config. l2lidar_rsimu.yaml uses the RealSense '
@@ -304,6 +332,17 @@ def generate_launch_description():
             'cloud_topic': '/cloud_registered_body',  # Point-LIO's name matches FAST-LIO's
             'odom_topic': '/odom_lio',       # only this differs from the FAST-LIO variant
             'map_frame': 'pgo_init',
+
+            # planar-motion prior -- see declare_planar_prior_cmd above
+            'planar_prior_enable': ParameterValue(
+                LaunchConfiguration('planar_prior'), value_type=bool),
+            'planar_gravity_auto': ParameterValue(
+                LaunchConfiguration('planar_gravity_auto'), value_type=bool),
+            'planar_gravity': ParameterValue(
+                LaunchConfiguration('planar_gravity'), value_type=List[float]),
+            'planar_sigma_h': ParameterValue(
+                LaunchConfiguration('planar_sigma_h'), value_type=float),
+
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
             # LOOP-CLOSURE ACCEPTANCE GATES, tightened 2026-08-10 after a run on
@@ -352,6 +391,10 @@ def generate_launch_description():
     ld.add_action(declare_save_directory_cmd)
     ld.add_action(declare_map_pcd_path_cmd)
     ld.add_action(declare_keyframe_filter_size_cmd)
+    ld.add_action(declare_planar_prior_cmd)
+    ld.add_action(declare_planar_gravity_auto_cmd)
+    ld.add_action(declare_planar_gravity_cmd)
+    ld.add_action(declare_planar_sigma_cmd)
     ld.add_action(declare_lio_config_file_cmd)
     ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_rviz_cmd)
