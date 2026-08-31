@@ -30,14 +30,16 @@ def generate_launch_description():
         description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
     )
 
-    # The finished 3D map goes NEXT TO THE 2D GRID it shares a frame with, in
-    # pepper_navigation/map -- not into save_directory, which is scratch (this
-    # node wipes <save_directory>/Scans at startup and fills it with one .pcd
-    # per keyframe plus pose logs). Written to the SOURCE tree so it survives a
-    # rebuild; pepper_navigation's CMakeLists installs map/*.pcd to its share.
+    # The finished 3D map goes into pepper_navigation/pcd (its own directory,
+    # separate from the .pgm/.yaml 2D grid in pepper_navigation/map even though
+    # both share the same levelled, floor-referenced frame) -- not into
+    # save_directory, which is scratch (this node wipes <save_directory>/Scans
+    # at startup and fills it with one .pcd per keyframe plus pose logs).
+    # Written to the SOURCE tree so it survives a rebuild; pepper_navigation's
+    # CMakeLists installs pcd/*.pcd to its share.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',
-        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/map/pepper_map_lc.pcd',
+        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/pcd/pepper_map_lc.pcd',
         description='Full path of the map written by /pgo_batch_optimize. Empty '
                     'falls back to <save_directory>/map_batch.pcd.'
     )

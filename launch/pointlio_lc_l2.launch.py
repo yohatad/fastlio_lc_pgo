@@ -61,7 +61,7 @@ def generate_launch_description():
     # rebuild; pepper_navigation's CMakeLists installs map/*.pcd to its share.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',
-        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/map/pepper_map_lc.pcd',
+        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/pcd/pepper_map_lc.pcd',
         description='Full path of the map written by /pgo_batch_optimize. Empty '
                     'falls back to <save_directory>/map_batch.pcd.'
     )
