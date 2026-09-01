@@ -212,7 +212,7 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # Point-LIO owns lio_init -> base_footprint (via lio_map_odom_bridge,
+    # Point-LIO owns lio_init -> base_footprint (via lio_odom_bridge,
     # same as FAST-LIO's variant). bridge_level_frame:='false' for the same
     # reason: PGO owns pgo_init -> lio_init below, so lio_init must keep a
     # single parent. The leveling happens one level up instead --

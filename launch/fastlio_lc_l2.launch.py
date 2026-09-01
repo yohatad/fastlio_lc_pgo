@@ -98,7 +98,7 @@ def generate_launch_description():
         description='FAST-LIO config. l2_rsimu.yaml uses the RealSense IMU '
                     '(recommended); l2.yaml uses the L2 s own.'
     )
-    # Must match the IMU the config selects, or lio_map_odom_bridge closes
+    # Must match the IMU the config selects, or lio_odom_bridge closes
     # odom -> base_footprint through the wrong static frame.
     declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
         'lidar_imu_frame', default_value='camera_imu_optical_frame',
@@ -220,7 +220,7 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # FAST-LIO owns lio_init -> base_footprint (via lio_map_odom_bridge).
+    # FAST-LIO owns lio_init -> base_footprint (via lio_odom_bridge).
     # bridge_level_frame:='false' disables the bridge's own leveled frame here
     # because PGO owns pgo_init -> lio_init below; otherwise lio_init
     # would get two parents. The leveling still happens, one level up:
