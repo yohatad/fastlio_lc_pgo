@@ -40,7 +40,7 @@
   <exec_depend>pcl_conversions</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>std_srvs</exec_depend>
-  <!-- Runs pepper_slam's lio_map_odom_bridge.py / cloud_range_filter.py.
+  <!-- Runs pepper_slam's lio_odom_bridge.py / cloud_range_filter.py.
        This dependency was real but undeclared while those scripts lived in
        fast_lio. -->
   <exec_depend>pepper_slam</exec_depend>

@@ -203,7 +203,7 @@ std::string map_pcd_path;
 // World frame all PGO outputs (map, path, odom, loop markers, TF parent) are
 // stamped in. Mirrors FAST-LIO's publish.map_frame parameter: defaults to the
 // legacy "camera_init" but is overridden to "odom" so the optimized map lands
-// in the same REP-105 tree the lio_map_odom_bridge already publishes.
+// in the same REP-105 tree the lio_odom_bridge already publishes.
 std::string map_frame = "camera_init";
 std::fstream pgTimeSaveStream;
 
