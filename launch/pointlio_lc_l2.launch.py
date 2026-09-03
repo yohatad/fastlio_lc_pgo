@@ -1,23 +1,14 @@
-# Point-LIO + PGO loop closure on the Pepper L2 rig -- the Point-LIO
-# equivalent of fastlio_lc_l2.launch.py (same file, FAST-LIO backend). See
-# that file for the detailed comments on why each piece is wired the way it
-# is; this only documents what's DIFFERENT for the Point-LIO backend.
+# Point-LIO + PGO loop closure -- the Point-LIO twin of fastlio_lc_l2.launch.py,
+# which carries the shared reasoning. What differs here:
 #
-# pgo_node's cloud_topic and odom_topic are plain overridable ROS parameters
-# (not hardcoded), and Point-LIO's registered-cloud topic name
-# (/cloud_registered_body) is IDENTICAL to FAST-LIO's -- only odom_topic
-# needs pointing at Point-LIO's /aft_mapped_to_init. No PGO/GTSAM source
-# changes needed for this swap.
+#   * Only odom_topic needs repointing. pgo_node's topics are plain parameters
+#     and Point-LIO's /cloud_registered_body is named identically to FAST-LIO's,
+#     so the swap needs no PGO or GTSAM source changes.
+#   * save_directory defaults SEPARATELY, because PGO wipes its Scans/ on
+#     startup and a shared directory would let one backend destroy the other's.
 #
-# save_directory defaults to a SEPARATE path from fastlio_lc_l2.launch.py's:
-# PGO wipes its Scans/ subfolder on startup, so sharing a directory between
-# the two backends would let one destroy the other's saved keyframes/map.
-#
-# Usage:
 #   ros2 launch fastlio_lc_pgo pointlio_lc_l2.launch.py
-#   ros2 bag play <bag> --clock --topics /points /imu/data /tf_static
-#   (replaying /tf is SAFE and wanted -- see pepper_sensor_tf.launch.py's
-#    header for why the old "do not replay /tf" advice no longer holds.)
+#   ros2 bag play <bag> --clock --topics /points /imu/data /tf /tf_static
 
 import os
 from typing import List
@@ -55,17 +46,10 @@ def generate_launch_description():
                     'backends cannot wipe each other\'s saved runs.'
     )
 
-    # The finished 3D map goes into pepper_navigation/pcd, beside the keyframe
-    # poses it is paired with -- not into save_directory, which is scratch (this
-    # node wipes <save_directory>/Scans at startup and fills it with one .pcd
-    # per keyframe plus pose logs).
-    # Written to the SOURCE tree, not the install share, so it survives a
-    # rebuild -- pepper_navigation's CMakeLists installs pcd/*.pcd from there.
-    # os.path.expanduser, not a literal /home/yoha: the old default only ever
-    # resolved on one machine, which is the anti-pattern the bag wrappers and
-    # pepper_navigation/CMakeLists.txt were both cleaned of. The remaining
-    # assumption is that the workspace sits at ~/ros2_ws; pass the argument if
-    # it does not. Empty falls back to <save_directory>/map_batch.pcd.
+    # Kept out of save_directory, which is scratch: this node wipes
+    # <save_directory>/Scans at startup. Writes to the SOURCE tree so the map
+    # survives a rebuild and pepper_navigation installs it from pcd/. Assumes
+    # the workspace is at ~/ros2_ws; pass the argument if it is not.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',
         default_value=os.path.expanduser(
@@ -134,14 +118,11 @@ def generate_launch_description():
         description='RViz config file path (shared with fastlio_lc_l2.launch.py -- '
                     'the PGO topics it visualizes are the same regardless of backend).'
     )
-    # false, NOT true: this is the LIVE entry point. Every wrapper in
-    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
-    # default only ever applies on the robot -- where 'true' pins sim time at 0,
-    # so tf never resolves and nothing fuses, silently and with no error.
-    # pepper_sensor_tf's 'publisher'/'scope' are NOT derived from this -- only
-    # use_sim_time is forwarded. On a bag, pass them yourself: publisher:=none
-    # if it carries its own /tf_static, publisher:=urdf scope:=all if it does
-    # not. The bag_test wrappers already default publisher to none.
+    # false, NOT true: this is the LIVE entry point, and 'true' on the robot
+    # pins sim time at 0, so tf never resolves and nothing fuses, silently.
+    # pepper_sensor_tf's publisher/scope are NOT derived from this -- on a bag
+    # pass publisher:=none if it carries its own /tf_static, publisher:=urdf
+    # scope:=all if it does not.
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.'
@@ -221,12 +202,9 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # Point-LIO owns lio_init -> base_footprint (via lio_odom_bridge,
-    # same as FAST-LIO's variant). bridge_level_frame:='false' for the same
-    # reason: PGO owns pgo_init -> lio_init below, so lio_init must keep a
-    # single parent. The leveling happens one level up instead --
-    # pgo_map_odom_bridge publishes map -> pgo_init -- so the leveled frame in
-    # this stack is 'map', not 'odom'.
+    # bridge_level_frame:='false': PGO owns pgo_init -> lio_init below, so
+    # lio_init must keep a single parent. Leveling happens one level up, via
+    # pgo_map_odom_bridge's map -> pgo_init, so the leveled frame here is 'map'.
     point_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(point_lio_share, 'launch', 'mapping_l2lidar_node.launch.py')
@@ -256,22 +234,16 @@ def generate_launch_description():
             'odom_topic': '/odom_lio',
             'pgo_odom_topic': '/aft_pgo_odom',
             'publish_level_frame': True,
-            # MUST match the LIO config's publish.body_frame. level_source
-            # 'calibration' builds the map -> pgo_init levelling rotation from
-            # base_frame -> lidar_imu_frame; left at the node's
-            # l2lidar_frame_imu default while Point-LIO estimates the RealSense
-            # IMU, the whole map is levelled by the WRONG mount and comes out
-            # roughly 90 deg off, with no error logged anywhere.
+            # MUST match the LIO config's publish.body_frame: the levelling
+            # rotation is built from base_frame -> lidar_imu_frame, so a
+            # mismatched mount levels the whole map ~90 deg off, silently.
             'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
         }],
     )
 
-    # NOTE: /cloud_registered_body must carry a frame_id that actually exists
-    # in the TF tree, or octomap_server's tf2 MessageFilter drops every scan
-    # and /projected_map stays empty forever. Point-LIO upstream hardcoded it
-    # to the nonexistent "body"; it is now the publish.body_frame parameter,
-    # set to l2lidar_frame_imu in point_lio/config/l2lidar_node.yaml (mirroring
-    # FAST_LIO/config/l2.yaml). Nothing needed here.
+    # /cloud_registered_body's frame_id must exist in the TF tree or
+    # octomap_server's MessageFilter drops every scan and /projected_map stays
+    # empty. Handled by publish.body_frame in point_lio's config; nothing here.
     range_filter_node = Node(
         package='pepper_slam',
         executable='cloud_range_filter.py',
@@ -312,12 +284,8 @@ def generate_launch_description():
         }],
     )
 
-    # No LD_LIBRARY_PATH override -- pgo_node is the identical executable
-    # regardless of which LIO backend's topics it's pointed at, and a fresh
-    # rebuild links it against ros-humble-gtsam 4.2.0 directly. See
-    # fastlio_lc_l2.launch.py's comment at the equivalent spot for the full
-    # story (a stale apt libgtsam4 4.1.1 this used to need is gone from this
-    # system; forcing a different GTSAM here now BREAKS it instead).
+    # No LD_LIBRARY_PATH override, for the reason fastlio_lc_l2.launch.py gives
+    # at the same spot: forcing a different GTSAM now breaks it.
     pgo_node = Node(
         package='fastlio_lc_pgo',
         executable='pgo_node',
@@ -327,15 +295,11 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
             'map_pcd_path': LaunchConfiguration('map_pcd_path'),
-            # MUST match pgo_map_odom_bridge's level_frame below ('map').
-            # pgo_node's own default is 'map_level', and when the two disagree
-            # its canTransform(level_frame, map_frame) fails, so it WARNS and
-            # silently saves the .pcd in the RAW pgo_init frame instead --
-            # ~90 deg off gravity (measured -92.2 deg roll / -88.1 deg yaw on
-            # 2026-08-22), which does not match the 2D grid octomap builds in
-            # 'map'. The service still returns success=True, so the only clue
-            # is the "frame pgo_init" in its message. Recover a map already
-            # saved that way with utils/build_pgo_map.py --level-tf.
+            # MUST match pgo_map_odom_bridge's level_frame ('map'); pgo_node's
+            # own default is 'map_level'. When they disagree it warns and saves
+            # the .pcd in the raw pgo_init frame -- ~90 deg off gravity -- while
+            # still returning success=True. Recover such a map with
+            # utils/build_pgo_map.py --level-tf.
             'level_frame': 'map',
             'keyframe_filter_size': LaunchConfiguration('keyframe_filter_size'),
             'cloud_topic': '/cloud_registered_body',  # Point-LIO's name matches FAST-LIO's
@@ -354,25 +318,14 @@ def generate_launch_description():
 
             'keyframe_meter_gap': 1.0,
             'keyframe_deg_gap': 10.0,
-            # LOOP-CLOSURE ACCEPTANCE GATES, tightened 2026-08-10 after a run on
-            # bag/slam_august_8_bag folded the map. The three values below had
-            # drifted apart from the pgo_node defaults in the permissive
-            # direction ALL AT ONCE, which is what let bad closures both get in
-            # and dominate:
-            #   sc_dist_thres              0.4 vs default 0.2  (2x looser detector)
-            #   loopFitnessScoreThreshold  0.3 vs default 0.3  (loose ICP gate)
-            #   loopNoiseScore             0.1 vs default 0.5  (5x MORE trusted)
-            # Observed in that run: closures accepted at ICP fitness 0.151, 0.178
-            # and 0.081 alongside rejects at 0.359/0.488 -- i.e. sitting right on
-            # the gate -- with query keyframes repeatedly matching one old node
-            # (89 -> 379/380/381, 220 -> 449..457). Indoor corridors are
+            # LOOP-CLOSURE ACCEPTANCE GATES. These had all drifted permissive
+            # at once and a run on bag/slam_august_8_bag folded the map --
+            # closures accepted at ICP fitness 0.081-0.178, right on the gate,
+            # with one old node matching many queries. Indoor corridors are
             # self-similar and the L2 gives only ~5.3k points per scan, so Scan
-            # Context descriptors are weak here and false positives are expected;
-            # the gates, not the detector, are what must be strict.
-            #
-            # There IS a Cauchy robust kernel on loop factors
-            # (laserPosegraphOptimization.cpp:303-305), but at variance 0.1 it
-            # cannot absorb a wrong constraint -- hence raising loopNoiseScore too.
+            # Context descriptors are weak and false positives are expected: the
+            # GATES, not the detector, must be strict. The Cauchy kernel on loop
+            # factors cannot absorb a wrong constraint at a loose variance.
             'sc_dist_thres': 0.2,   # was 0.4 -- back to the pgo_node default
             'sc_max_radius': 20.0,
             'historyKeyframeSearchRadius': 1.5,

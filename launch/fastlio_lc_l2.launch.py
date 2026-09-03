@@ -1,3 +1,16 @@
+# FAST-LIO + pose-graph loop closure (MAPPING) on the Unitree L2.
+#
+#   pepper_sensor_tf     static rig TF
+#   FAST-LIO             odometry -> /odom_lio, /cloud_registered_body
+#   lio_odom_bridge      lio_init -> base_footprint
+#   pgo_node             loop closure -> /aft_pgo_odom, /aft_pgo_map
+#   pgo_map_odom_bridge  map -> pgo_init -> lio_init, and the upright 'map'
+#   octomap_server       ray-traced 2D grid on /projected_map (occupancy:=true)
+#
+# Nothing is written until you call
+#   ros2 service call /pgo_batch_optimize std_srvs/srv/Trigger
+# which saves map_pcd_path plus optimized_poses.txt under save_directory.
+
 import os
 from typing import List
 
@@ -31,18 +44,10 @@ def generate_launch_description():
         description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
     )
 
-    # The finished 3D map goes into pepper_navigation/pcd (its own directory,
-    # separate from the .pgm/.yaml 2D grid in pepper_navigation/map even though
-    # both share the same levelled, floor-referenced frame) -- not into
-    # save_directory, which is scratch (this node wipes <save_directory>/Scans
-    # at startup and fills it with one .pcd per keyframe plus pose logs).
-    # Written to the SOURCE tree, not the install share, so it survives a
-    # rebuild -- pepper_navigation's CMakeLists installs pcd/*.pcd from there.
-    # os.path.expanduser, not a literal /home/yoha: the old default only ever
-    # resolved on one machine, which is the anti-pattern the bag wrappers and
-    # pepper_navigation/CMakeLists.txt were both cleaned of. The remaining
-    # assumption is that the workspace sits at ~/ros2_ws; pass the argument if
-    # it does not. Empty falls back to <save_directory>/map_batch.pcd.
+    # Kept out of save_directory, which is scratch: this node wipes
+    # <save_directory>/Scans at startup. Writes to the SOURCE tree so the map
+    # survives a rebuild and pepper_navigation installs it from pcd/. Assumes
+    # the workspace is at ~/ros2_ws; pass the argument if it is not.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',
         default_value=os.path.expanduser(
@@ -51,39 +56,28 @@ def generate_launch_description():
                     'falls back to <save_directory>/map_batch.pcd.'
     )
 
-    # MUST be declared here, not only in the bag wrapper: ROS 2 launch silently
-    # DROPS launch_arguments an included description does not declare. The
-    # wrapper passed keyframe_filter_size:=0.25 for months and pgo_node kept its
-    # own 0.4 default (verified with `ros2 param get /laserPGO
-    # keyframe_filter_size`), so every map was coarser than intended. This leaf
-    # is applied BEFORE a keyframe is stored, so map_save_filter_size can never
-    # recover the resolution it discarded.
+    # MUST be declared here, not only in the bag wrapper: launch silently DROPS
+    # launch_arguments an included description does not declare, and this one
+    # went unnoticed for months. Applied BEFORE storage, so map_save_filter_size
+    # can never recover the resolution it discards.
     declare_keyframe_filter_size_cmd = DeclareLaunchArgument(
         'keyframe_filter_size', default_value='0.25',
         description='Voxel leaf (m) applied to each keyframe BEFORE storage, so '
                     'it bounds the density of every downstream product. 0.25 '
                     "matches FAST-LIO's own filter_size_surf, the real floor."
     )
-    # 2026-08-12: was hardcoded to l2.yaml, i.e. the L2's own IMU. That gyro
-    # cancels rotation about the gravity axis below ~16 deg/s and cost 139 deg
-    # of heading over a 744 s run (utils/L2_IMU/REPORT.md), so loop closure was
-    # being asked to repair odometry with a known, large, systematic yaw error.
-    # l2_rsimu.yaml drives the same estimator from the RealSense IMU instead;
-    # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst.
     # Down a corridor the two long walls give the scan matcher nothing to fix
     # height against, so z drifts without bound and loop closure cannot pull it
-    # back (measured on slam_20260823_merged: an 80.3 m z band, and a full batch
-    # re-optimization over 2736 keyframes moved the graph error only 1.2%).
-    # This pins every keyframe to the first one's height and nothing else.
+    # back: measured on slam_20260823_merged, an 80.3 m z band that a full batch
+    # re-optimization over 2736 keyframes moved only 1.2%. This pins every
+    # keyframe to the first one's height and nothing else.
     declare_planar_prior_cmd = DeclareLaunchArgument(
         'planar_prior', default_value='true',
         description='Constrain keyframe height to the floor plane. Turn off '
                     'only if the robot actually changes level (ramp, lift).')
-    # Which axis the prior holds. Derived at runtime from the same map <-
-    # pgo_init transform the saved cloud is leveled by, so the two cannot
-    # disagree. The hardcoded value below was 2.43 deg off that axis, and over
-    # an 85 m corridor that leaked 3.0 m of height back into a trajectory whose
-    # own constrained axis was pinned to 0.14 m.
+    # Which axis the prior holds, derived from the same transform the saved
+    # cloud is leveled by so the two cannot disagree. The hand-set value below
+    # was 2.43 deg off, which leaked 3.0 m of height back over an 85 m corridor.
     declare_planar_gravity_auto_cmd = DeclareLaunchArgument(
         'planar_gravity_auto', default_value='true',
         description='Derive the prior axis from the leveling TF. Set false only '
@@ -100,6 +94,10 @@ def generate_launch_description():
         description='Std dev [m] of how far off the floor plane a keyframe may '
                     'sit. Loosen if the floor is genuinely uneven.')
 
+    # The L2's own gyro cancels rotation about the gravity axis below ~16 deg/s
+    # and cost 139 deg of heading over a 744 s run (utils/L2_IMU/REPORT.md) --
+    # asking loop closure to repair a known systematic yaw error. The RealSense
+    # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst.
     declare_lio_config_file_cmd = DeclareLaunchArgument(
         'lio_config_file', default_value='l2_rsimu.yaml',
         description='FAST-LIO config. l2_rsimu.yaml uses the RealSense IMU '
@@ -122,14 +120,11 @@ def generate_launch_description():
         'rviz_cfg', default_value=default_rviz_cfg,
         description='RViz config file path'
     )
-    # false, NOT true: this is the LIVE entry point. Every wrapper in
-    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
-    # default only ever applies on the robot -- where 'true' pins sim time at 0,
-    # so tf never resolves and nothing fuses, silently and with no error.
-    # pepper_sensor_tf's 'publisher'/'scope' are NOT derived from this -- only
-    # use_sim_time is forwarded. On a bag, pass them yourself: publisher:=none
-    # if it carries its own /tf_static, publisher:=urdf scope:=all if it does
-    # not. The bag_test wrappers already default publisher to none.
+    # false, NOT true: this is the LIVE entry point, and 'true' on the robot
+    # pins sim time at 0, so tf never resolves and nothing fuses, silently.
+    # pepper_sensor_tf's publisher/scope are NOT derived from this -- on a bag
+    # pass publisher:=none if it carries its own /tf_static, publisher:=urdf
+    # scope:=all if it does not.
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.'
@@ -140,12 +135,8 @@ def generate_launch_description():
                     'build a ray-traced 2D OccupancyGrid on /projected_map. Save it: '
                     'ros2 run nav2_map_server map_saver_cli -t /projected_map -f <name>'
     )
-    # Height band for the 2D projection, in the map (gravity-aligned)
-    # frame. map is now FLOOR-referenced (level_frame_on_floor in
-    # pgo_map_odom_bridge puts its z=0 on the ground plane instead of at the
-    # LIO start pose ~lidar-mount height up), so these are plain heights above
-    # the floor. They used to be -0.25/1.0 against a floor measured at
-    # ~-0.45 m; the same physical band is now 0.20/1.45.
+    # Height band for the 2D projection. 'map' is FLOOR-referenced (z=0 on the
+    # ground plane), so these are plain heights above the floor.
     declare_occ_min_z_cmd = DeclareLaunchArgument(
         'occ_min_z', default_value='0.20',
         description='occupancy_min_z for octomap: height above the FLOOR (map '
@@ -169,12 +160,11 @@ def generate_launch_description():
                     'out to this. Kept at full range for accuracy; clean the thin clearing-'
                     'ray spokes off the FINISHED map with clean_occupancy_map.py instead.'
     )
-    # Radius-outlier removal is OFF by default: the per-scan L2 cloud is sparse,
-    # so any neighbourly setting also deletes real far-wall returns (tested
-    # 3-in-0.25 m dropped ~60% of points), and it does NOT remove the clearing-
-    # ray spokes anyway (those come from real see-through observations, not spike
-    # endpoints -- use clean_occupancy_map.py for spokes). Enable ONLY if you see
-    # isolated occupied dots, and keep it loose (e.g. ror_radius:=0.5).
+    # OFF by default: the per-scan L2 cloud is sparse, so any neighbourly
+    # setting also deletes real far-wall returns (3-in-0.25 m dropped ~60% of
+    # points), and it does not touch clearing-ray spokes anyway -- those need
+    # clean_occupancy_map.py. Enable only for isolated occupied dots, and keep
+    # it loose.
     declare_ror_neighbors_cmd = DeclareLaunchArgument(
         'ror_min_neighbors', default_value='0',
         description='Radius-outlier removal: drop scan points with fewer than this many '
@@ -212,15 +202,11 @@ def generate_launch_description():
     mapviz_filter_size = LaunchConfiguration('mapviz_filter_size')
     map_save_filter_size = LaunchConfiguration('map_save_filter_size')
 
-    # Static sensor rig: base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams).
-    # This is the piece missing from the bag's own /tf; without it the FAST-LIO
-    # bridge cannot close odom -> base_footprint.
-    # scope:=all is required for BAG REPLAY. pepper_sensor_tf's default 'mount'
-    # scope omits the owner:driver camera edges on the assumption the RealSense
-    # driver is publishing them live; with no driver the tree comes up as
-    # disconnected islands and camera_imu_optical_frame -- which l2_rsimu.yaml
-    # names as the body frame -- does not resolve at all. Use 'mount' on the
-    # real robot so the driver's device-read values win.
+    # Static rig TF. The bridge needs base_footprint -> l2lidar_frame_imu from
+    # here to close odom -> base_footprint. Only use_sim_time is forwarded, so
+    # scope keeps its own 'mount' default -- right on the robot, where the
+    # driver publishes the camera edges itself. See use_sim_time above for what
+    # to pass on a bag.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')
@@ -274,19 +260,9 @@ def generate_launch_description():
         }],
     )
 
-    # Ray-traced 2D occupancy grid via octomap_server. It consumes the PER-SCAN
-    # cloud /cloud_registered_body (body frame l2lidar_frame_imu) and, using our
-    # corrected TF (map -> odom -> base_footprint -> l2lidar_frame_imu), clears free
-    # space by casting rays from each scan's sensor origin -- which a top-down
-    # projection of the accumulated /aft_pgo_map cannot do. The octree is built
-    # in the gravity-aligned map frame so the down-projection is level.
-    # Publishes nav_msgs/OccupancyGrid on /projected_map.
-    # NOTE: octomap inserts scans online and does not retro-correct already-
-    # inserted voxels, so a LARGE loop closure leaves a seam; rebuild from
-    # corrected keyframes if that matters. For room/corridor drift it is fine.
-    # Strip robot self-hits (near-field cluster within ~0.6 m of the low lidar)
-    # from the scan before octomap; otherwise they print as a black trail along
-    # the path. Only octomap consumes the filtered cloud; SLAM is untouched.
+    # Strips the robot self-hits the low lidar sees (they print as a black trail
+    # along the path) before octomap. Only octomap consumes the filtered cloud;
+    # SLAM is untouched.
     range_filter_node = Node(
         package='pepper_slam',
         executable='cloud_range_filter.py',
@@ -303,6 +279,12 @@ def generate_launch_description():
         }],
     )
 
+    # Ray-traced 2D grid on /projected_map. Consumes the PER-SCAN cloud so it
+    # can clear free space by casting rays from each sensor origin, which a
+    # top-down projection of the accumulated /aft_pgo_map cannot do. Built in
+    # the gravity-aligned map frame so the projection is level.
+    # NOTE: octomap does not retro-correct inserted voxels, so a LARGE loop
+    # closure leaves a seam. Fine for room/corridor drift.
     octomap_node = Node(
         package='octomap_server',
         executable='octomap_server_node',
@@ -334,21 +316,11 @@ def generate_launch_description():
         }],
     )
 
-    # Historical note: this used to need an LD_LIBRARY_PATH override to avoid
-    # loading an ABI-incompatible GTSAM at runtime (a stale apt libgtsam4
-    # 4.1.1 the binary was originally compiled against, vs. ros-humble-gtsam
-    # 4.2.0 installed alongside it). That apt package no longer exists on
-    # this system at all -- confirmed via `dpkg -l | grep gtsam` finding only
-    # ros-humble-gtsam, and a rebuild of this package now links pgo_node
-    # against ros-humble-gtsam 4.2.0 directly (confirmed via `ldd`), with no
-    # override needed. Re-adding an LD_LIBRARY_PATH override here would
-    # actively BREAK it again: this machine also has a second, differently-
-    # built GTSAM 4.2.0 at /usr/local/lib (undefined symbol on
-    # NonlinearFactor::rekey when loaded instead -- a TBB build-config
-    # mismatch, not a version mismatch). If this starts crashing again after
-    # a future system change, check `ldd pgo_node | grep gtsam` before
-    # reaching for an env override -- confirm which GTSAM it actually needs
-    # first.
+    # Do NOT add an LD_LIBRARY_PATH override here. One used to be needed for a
+    # stale apt GTSAM; that package is gone and pgo_node links ros-humble-gtsam
+    # 4.2.0 directly. An override now picks up the differently-built 4.2.0 at
+    # /usr/local/lib instead (undefined symbol on NonlinearFactor::rekey, a TBB
+    # config mismatch). If it crashes again, check `ldd pgo_node | grep gtsam`.
     pgo_node = Node(
         package='fastlio_lc_pgo',
         executable='pgo_node',
@@ -358,15 +330,11 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'save_directory': save_directory,
             'map_pcd_path': LaunchConfiguration('map_pcd_path'),
-            # MUST match pgo_map_odom_bridge's level_frame below ('map').
-            # pgo_node's own default is 'map_level', and when the two disagree
-            # its canTransform(level_frame, map_frame) fails, so it WARNS and
-            # silently saves the .pcd in the RAW pgo_init frame instead --
-            # ~90 deg off gravity (measured -92.2 deg roll / -88.1 deg yaw on
-            # 2026-08-22), which does not match the 2D grid octomap builds in
-            # 'map'. The service still returns success=True, so the only clue
-            # is the "frame pgo_init" in its message. Recover a map already
-            # saved that way with utils/build_pgo_map.py --level-tf.
+            # MUST match pgo_map_odom_bridge's level_frame ('map'); pgo_node's
+            # own default is 'map_level'. When they disagree it warns and saves
+            # the .pcd in the raw pgo_init frame -- ~90 deg off gravity -- while
+            # still returning success=True. Recover such a map with
+            # utils/build_pgo_map.py --level-tf.
             'level_frame': 'map',
             'keyframe_filter_size': LaunchConfiguration('keyframe_filter_size'),
             'cloud_topic': '/cloud_registered_body',
@@ -401,14 +369,12 @@ def generate_launch_description():
             # per pepper_slam/config/sensor_tf.yaml. Wrong values here skew the
             # height binning the descriptor is built from.
             'sc_lidar_height': 0.2582,
-            # performSCLoopClosure() was dead code until 2026-08-12; descriptors
-            # were built for every keyframe and never read. Now callable, but
-            # OFF by default: Scan Context's known failure mode is self-similar
-            # geometry, and a repetitive indoor corridor is exactly that. Its
-            # value is covering what the radius search structurally cannot --
-            # a revisit once drift already exceeds historyKeyframeSearchRadius.
-            # Every candidate it proposes still faces the same ICP fitness test.
-            # Turn on if closures are being missed after long open-loop stretches.
+            # OFF: Scan Context's failure mode is self-similar geometry, and a
+            # repetitive indoor corridor is exactly that. It covers what the
+            # radius search structurally cannot -- a revisit once drift exceeds
+            # historyKeyframeSearchRadius -- and its candidates still face the
+            # same ICP fitness test. Turn on if closures are missed after long
+            # open-loop stretches.
             'use_scan_context': False,
 
             # loop closure
@@ -424,56 +390,28 @@ def generate_launch_description():
             'loopClosureFrequency': 4.0,
             'graphUpdateFrequency': 2.0,
             'graphUpdateTimes': 5,
-            # 2026-08-12: 0.1 -> 0.01. initNoises() gives each odometry edge
-            # 1e-6 rad^2 / 1e-4 m^2, so over a 100-keyframe loop the chain
-            # accumulates ~1e-4 rad^2 / 1e-2 m^2. A loop factor at 0.1 was one
-            # to three orders LOOSER than the chain it was meant to correct, so
-            # iSAM2 kept the odometry and barely moved the graph -- worst for
-            # rotation, which is the dominant indoor error mode. 0.01 puts the
-            # loop factor at the chain's translational scale.
-            # NB robustLoopNoise wraps this in a Cauchy m-estimator, which
-            # downweights large residuals further, so the effective correction
-            # is softer than the raw variance ratio suggests. Validate on a run
-            # with a known revisit before trusting the number.
-            # Split rotation from translation, mirroring odomNoise's own 100x
-            # split (1e-6 rad^2 / 1e-4 m^2 per edge). A single scalar across all
-            # six DOF cannot sit correctly against both: MEASURED on this bag
-            # with the L2 IMU at a uniform 0.01, translation got ~50% of the
-            # loop error but rotation only ~1%, and the endpoint improved just
-            # 0.735 -> 0.579 m. Each value now sits at its own chain's
-            # accumulated scale over a ~100-keyframe loop.
-            # loopNoiseScore below is the legacy uniform fallback, unused while
-            # both of these are positive.
-            # MEASURED and NOT adopted: 1e-4 / 1e-2 was tried on this bag with
-            # l2.yaml and did NOT beat the uniform 0.01 -- correction fell to
-            # 0.330 m / 2.49 deg from 0.475 m / 2.76 deg, and the endpoint gained
-            # only 1.7% against 21.1%. That comparison is CONFOUNDED, though: the
-            # two runs' RAW odometry differed (end error 0.735 vs 0.985 m, path
-            # 165.37 vs 165.73 m) because FAST-LIO replay is nondeterministic, so
-            # PGO saw different input and the run-to-run variance exceeds the
-            # effect. Treat the numbers as inconclusive, not as evidence against.
+            # 0.01, not the original 0.1: each odometry edge is 1e-6 rad^2 /
+            # 1e-4 m^2, so a 100-keyframe loop accumulates ~1e-4 / 1e-2. At 0.1
+            # the loop factor was looser than the chain it had to correct and
+            # iSAM2 barely moved the graph. Note robustLoopNoise wraps this in a
+            # Cauchy kernel, so the realised correction is softer than the raw
+            # variance ratio suggests -- and tightening further can therefore
+            # HURT, by making each residual larger in sigmas.
             #
-            # If the effect is real, the likely cause is the Cauchy kernel:
-            # tightening the variance makes each residual larger IN SIGMAS, and
-            # Cauchy downweights large normalised residuals harder, so
-            # over-trusting a loop factor can reduce its realised influence.
-            #
-            # To settle it, remove the nondeterminism: record FAST-LIO's
-            # /odom_lio and /cloud_registered_body ONCE, then replay that fixed
-            # recording into PGO for each candidate setting, so every arm sees
-            # byte-identical input.
-            #
-            # -1.0 means "fall back to loopNoiseScore", i.e. the uniform value.
+            # Splitting rotation from translation (Rot/Trans below, -1.0 = fall
+            # back to the uniform value) was measured at 1e-4 / 1e-2 and did not
+            # beat the uniform 0.01. That test is CONFOUNDED -- FAST-LIO replay
+            # is nondeterministic, so the two arms saw different odometry and
+            # run-to-run variance exceeded the effect. Inconclusive, not
+            # evidence against. To settle it, record /odom_lio and
+            # /cloud_registered_body once and replay that fixed input per arm.
             'loopNoiseScoreRot': -1.0,
             'loopNoiseScoreTrans': -1.0,
             'loopNoiseScore': 0.01,
-            # 2026-08-12: 10.0 -> 0.1 (the node's own default). pubMap() rebuilds
-            # the ENTIRE map every call -- local2global over every keyframe, then
-            # a voxel filter over the whole accumulated cloud -- while holding
-            # mKF. At 10 Hz and a few hundred keyframes it cannot keep up, so it
-            # spins continuously holding the lock, starving keyframe insertion,
-            # updatePoses and the ICP thread while odometryBuf/fullResBuf grow
-            # unbounded.
+            # Low on purpose: pubMap() rebuilds the ENTIRE map every call while
+            # holding mKF. At 10 Hz and a few hundred keyframes it spins
+            # continuously holding the lock, starving keyframe insertion and the
+            # ICP thread while the buffers grow unbounded.
             'vizmapFrequency': 0.1,
             'loopFitnessScoreThreshold': 0.3,
             'mapviz_filter_size': mapviz_filter_size,
