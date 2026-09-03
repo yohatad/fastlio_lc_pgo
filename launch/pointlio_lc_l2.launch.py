@@ -47,21 +47,29 @@ def generate_launch_description():
     occupancy = LaunchConfiguration('occupancy')
 
     declare_save_directory_cmd = DeclareLaunchArgument(
-        'save_directory', default_value='/home/yoha/Lidar/run_l2_lc_pointlio/pgo_output/',
+        'save_directory',
+        default_value=os.path.expanduser('~/Lidar/run_l2_lc_pointlio/pgo_output/'),
         description='Directory where PGO writes optimized poses, odom poses, times and '
                     'keyframe scans (its Scans/ subfolder is wiped on startup). Kept '
                     'separate from fastlio_lc_l2.launch.py\'s default so the two '
                     'backends cannot wipe each other\'s saved runs.'
     )
 
-    # The finished 3D map goes NEXT TO THE 2D GRID it shares a frame with, in
-    # pepper_navigation/map -- not into save_directory, which is scratch (this
+    # The finished 3D map goes into pepper_navigation/pcd, beside the keyframe
+    # poses it is paired with -- not into save_directory, which is scratch (this
     # node wipes <save_directory>/Scans at startup and fills it with one .pcd
-    # per keyframe plus pose logs). Written to the SOURCE tree so it survives a
-    # rebuild; pepper_navigation's CMakeLists installs map/*.pcd to its share.
+    # per keyframe plus pose logs).
+    # Written to the SOURCE tree, not the install share, so it survives a
+    # rebuild -- pepper_navigation's CMakeLists installs pcd/*.pcd from there.
+    # os.path.expanduser, not a literal /home/yoha: the old default only ever
+    # resolved on one machine, which is the anti-pattern the bag wrappers and
+    # pepper_navigation/CMakeLists.txt were both cleaned of. The remaining
+    # assumption is that the workspace sits at ~/ros2_ws; pass the argument if
+    # it does not. Empty falls back to <save_directory>/map_batch.pcd.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',
-        default_value='/home/yoha/ros2_ws/src/pepper4dec/pepper_navigation/pcd/pepper_map_lc.pcd',
+        default_value=os.path.expanduser(
+            '~/ros2_ws/src/pepper4dec/pepper_navigation/pcd/pepper_map_lc.pcd'),
         description='Full path of the map written by /pgo_batch_optimize. Empty '
                     'falls back to <save_directory>/map_batch.pcd.'
     )
@@ -116,7 +124,7 @@ def generate_launch_description():
                     'camera_imu_optical_frame for l2lidar_rsimu.yaml, '
                     'l2lidar_frame_imu for l2lidar_node.yaml.')
     declare_rviz_cmd = DeclareLaunchArgument(
-        'rviz', default_value='false',
+        'rviz', default_value='true',
         description='Launch RViz2 with both the raw Point-LIO view and the loop-closure '
                     '(PGO) view pre-configured (/aft_pgo_map, /aft_pgo_path, '
                     '/loop_closure_constraints).'
