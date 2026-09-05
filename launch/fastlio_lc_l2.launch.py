@@ -430,6 +430,16 @@ def generate_launch_description():
             'config_file': LaunchConfiguration('lio_config_file'),
             'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'bridge_level_frame': 'false',
+            # flatten_base_frame defaults TRUE in lio_odom_bridge, but flattening
+            # needs the level frame's rotation snapshot to know which way is up in
+            # the raw tilted odom frame. With bridge_level_frame false there is no
+            # snapshot, so the bridge logged an ERROR on every startup of this
+            # launch and skipped flattening anyway:
+            #   "flatten_base_frame is true but publish_level_frame is false"
+            # Say false explicitly: the levelling in THIS stack happens one level
+            # up, in pgo_map_odom_bridge's map -> pgo_init, so the bridge has
+            # nothing to flatten and the error was pure noise.
+            'flatten_base_frame': 'false',
         }.items())
 
 
