@@ -3,3 +3,10 @@ __pycache__/
 build/
 install/
 log/
+
+# colcon scratch, if a build is ever run from inside this package rather than
+# the workspace root. Delete it when it appears; ignoring is only so it cannot
+# be committed by accident.
+/build/
+/install/
+/log/
