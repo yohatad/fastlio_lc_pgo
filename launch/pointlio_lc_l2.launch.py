@@ -246,7 +246,7 @@ def generate_launch_description():
     # empty. Handled by publish.body_frame in point_lio's config; nothing here.
     range_filter_node = Node(
         package='pepper_slam',
-        executable='cloud_range_filter.py',
+        executable='cloud_range_filter',
         name='cloud_range_filter',
         output='screen',
         condition=IfCondition(occupancy),

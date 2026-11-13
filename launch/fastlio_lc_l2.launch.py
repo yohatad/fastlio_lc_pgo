@@ -265,7 +265,7 @@ def generate_launch_description():
     # SLAM is untouched.
     range_filter_node = Node(
         package='pepper_slam',
-        executable='cloud_range_filter.py',
+        executable='cloud_range_filter',
         name='cloud_range_filter',
         output='screen',
         condition=IfCondition(occupancy),
