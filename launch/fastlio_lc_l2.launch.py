@@ -241,9 +241,9 @@ def generate_launch_description():
         name='pgo_map_odom_bridge',
         output='screen',
         # The rest of its parameters live in pepper_slam's
-        # config/pgo_map_odom_bridge_configuration.yaml.
+        # config/pepper_slam_configuration.yaml.
         parameters=[os.path.join(get_package_share_directory('pepper_slam'), 'config',
-                                 'pgo_map_odom_bridge_configuration.yaml'), {
+                                 'pepper_slam_configuration.yaml'), {
             'use_sim_time': use_sim_time,
             'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             # MUST match the LIO config's publish.body_frame. level_source
