@@ -225,15 +225,11 @@ def generate_launch_description():
         executable='pgo_map_odom_bridge.py',
         name='pgo_map_odom_bridge',
         output='screen',
-        parameters=[{
+        # The rest of its parameters live in pepper_slam's
+        # config/pgo_map_odom_bridge_configuration.yaml.
+        parameters=[os.path.join(get_package_share_directory('pepper_slam'), 'config',
+                                 'pgo_map_odom_bridge_configuration.yaml'), {
             'use_sim_time': use_sim_time,
-            'map_frame': 'pgo_init',
-            'odom_frame': 'lio_init',
-            'base_frame': 'base_footprint',
-            'level_frame': 'map',
-            'odom_topic': '/odom_lio',
-            'pgo_odom_topic': '/aft_pgo_odom',
-            'publish_level_frame': True,
             # MUST match the LIO config's publish.body_frame: the levelling
             # rotation is built from base_frame -> lidar_imu_frame, so a
             # mismatched mount levels the whole map ~90 deg off, silently.
