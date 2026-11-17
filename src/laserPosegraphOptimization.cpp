@@ -490,9 +490,10 @@ void pubPath( void )
     // recentIdxUpdated == 0 it never executes and the DEFAULT-CONSTRUCTED
     // odomAftPGO went out: position (0,0,0), quaternion (0,0,0,0) -- not a unit
     // quaternion -- and stamp 0, followed by a TF carrying the same. Downstream
-    // pgo_map_odom_bridge.py does not validate it: pose_to_matrix falls back to
-    // identity rotation on the degenerate quaternion and latches a bogus
-    // pgo_init -> lio_init correction until the next PGO update.
+    // pgo_map_odom_bridge did not validate it then: it fell back to identity
+    // rotation on the degenerate quaternion and latched a bogus
+    // pgo_init -> lio_init correction until the next PGO update. It now rejects
+    // such poses too, but this keeps them from being published at all.
     if (recentIdxUpdated <= 0)
         return;
 

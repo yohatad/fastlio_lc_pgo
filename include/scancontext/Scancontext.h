@@ -83,7 +83,7 @@ public:
     // Sensor height above the floor, added to every point's z before the polar
     // grid is binned, so the descriptor is referenced to the ground rather than
     // to the sensor. Upstream hardcodes 2.0 -- a car/handheld-rig value. Pepper
-    // carries the L2 at 0.2582 m (pepper_slam/config/sensor_tf.yaml,
+    // carries the L2 at 0.2582 m (pepper_slam/data/sensor_tf.yaml,
     // base_footprint -> l2lidar_frame), so 2.0 shifted every point ~1.75 m up
     // and skewed the height binning the descriptor is built from. Now settable;
     // see setLidarHeight(). Use 0 if you feed scans already in base coords.
