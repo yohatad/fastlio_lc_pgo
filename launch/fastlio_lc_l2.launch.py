@@ -97,19 +97,19 @@ def generate_launch_description():
     # The L2's own gyro cancels rotation about the gravity axis below ~16 deg/s
     # and cost 139 deg of heading over a 744 s run (utils/L2_IMU/REPORT.md) --
     # asking loop closure to repair a known systematic yaw error. The RealSense
-    # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst.
+    # measured 3.8% -> 2.4% mean yaw error, 11.2% -> 4.6% worst, and FAST_LIO
+    # removed l2.yaml (the L2's own IMU) in 78a8d0c.
     declare_lio_config_file_cmd = DeclareLaunchArgument(
         'lio_config_file', default_value='l2_rsimu.yaml',
-        description='FAST-LIO config. l2_rsimu.yaml uses the RealSense IMU '
-                    '(recommended); l2.yaml uses the L2 s own.'
+        description='FAST-LIO config. l2_rsimu.yaml (RealSense IMU, the '
+                    'default) is the only L2 config.'
     )
     # Must match the IMU the config selects, or lio_odom_bridge closes
     # odom -> base_footprint through the wrong static frame.
     declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
         'lidar_imu_frame', default_value='camera_imu_optical_frame',
         description='Static frame the estimated body corresponds to. '
-                    'camera_imu_optical_frame for l2_rsimu.yaml, '
-                    'l2lidar_frame_imu for l2.yaml.'
+                    'camera_imu_optical_frame for l2_rsimu.yaml.'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='true',
